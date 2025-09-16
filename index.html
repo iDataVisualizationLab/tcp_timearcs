@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IP Connection Analysis - Vertical Lines</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 1rem;
+            background-color: #f8f9fa;
+            color: #212529;
+            height: 100vh;
+            display: grid;
+            grid-template-rows: auto 1fr; /* header + main layout */
+            overflow: hidden; /* prevent page scroll; columns will scroll */
+        }
+        h1 {
+            color: #343a40;
+        }
+        /* Layout: chart left, sidebar right */
+        #main-layout {
+            display: flex;
+            gap: 16px;
+            align-items: stretch;
+            height: 100%;
+            min-height: 0; /* enable children to use overflow */
+        }
+        #chart-column {
+            flex: 1 1 auto;
+            min-width: 0; /* allow flex children to shrink properly */
+            height: 100%;
+            overflow-y: auto; /* independent scroll */
+            -webkit-overflow-scrolling: touch;
+        }
+        #sidebar {
+            flex: 0 0 360px;
+            max-width: 420px;
+            height: 100%;
+            overflow-y: auto; /* independent scroll */
+            -webkit-overflow-scrolling: touch;
+        }
+        .controls {
+            margin-bottom: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        label {
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .tooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.85);
+            color: #fff;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 1000;
+        }
+        .legend { font-family: sans-serif; }
+        .legend-item { cursor: pointer; }
+        .legend-item.faded { opacity: 0.3; }
+        .timeline-line { stroke: #eee; stroke-width: 1; }
+        .hover-arc {
+            animation: fadeIn 0.2s ease-in-out;
+        }
+        .flow-arc {
+            stroke-width: 1px;
+            stroke-opacity: 0.7;
+            fill: none;
+            /* allow pointer events on the stroke so we can hover lines */
+            pointer-events: stroke;
+            cursor: pointer;
+        }
+        /* Default opacity for packet circles (80%) */
+        .direction-dot { opacity: 0.6; }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .handshake-lines line {
+            stroke-width: 2px;
+            stroke-opacity: 0.8;
+            stroke-dasharray: 5,5;
+        }
+        .handshake-lines text {
+            font-size: 10px;
+            font-weight: bold;
+            fill: #2c3e50;
+        }
+        .closing-lines line {
+            stroke-width: 2px;
+            stroke-opacity: 0.8;
+            stroke-dasharray: 3,3;
+        }
+        .closing-lines text {
+            font-size: 10px;
+            font-weight: bold;
+            fill: #2c3e50;
+        }
+        .ground-truth-box {
+            fill-opacity: 0.3;
+            stroke-width: 2px;
+            stroke-opacity: 0.8;
+            cursor: pointer;
+        }
+        .ground-truth-box:hover {
+            fill-opacity: 0.5;
+            stroke-opacity: 1;
+        }
+        .ground-truth-label {
+            font-size: 10px;
+            font-weight: bold;
+            fill: #2c3e50;
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+        /* TCP Flow Styles - Lines removed, only using for packet filtering */
+
+        /* Flow List Styles */
+        .flow-item {
+            display: flex;
+            align-items: center;
+            padding: 8px;
+            margin-bottom: 5px;
+            border: 1px solid #e9ecef;
+            border-radius: 3px;
+            background: #f8f9fa;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        .flow-item:hover {
+            background: #e9ecef;
+            border-color: #3490dc;
+        }
+        .flow-item.selected {
+            background: #e3f2fd;
+            border-color: #2196f3;
+        }
+        .flow-checkbox {
+            margin-right: 8px;
+            cursor: pointer;
+        }
+        .flow-info {
+            flex: 1;
+            font-size: 11px;
+        }
+        .flow-connection {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 2px;
+        }
+        .flow-details {
+            color: #666;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        .flow-zoom-btn {
+            margin-left: auto;
+            padding: 2px 6px;
+            font-size: 10px;
+            border: 1px solid #007bff;
+            border-radius: 3px;
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        .flow-zoom-btn:hover {
+            background: #0056b3;
+            border-color: #0056b3;
+        }
+        .flow-status {
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .flow-status.established {
+            background: #d4edda;
+            color: #155724;
+        }
+        .flow-status.establishing {
+            background: #fff3cd;
+            color: #856404;
+        }
+        .flow-status.data_transfer {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        .flow-status.closing {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .flow-status.closed {
+            background: #e2e3e5;
+            color: #383d41;
+        }
+        .flow-status.aborted {
+            background: #f5c6cb;
+            color: #721c24;
+        }
+        .flow-status.invalid {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .flow-item.hidden {
+            display: none;
+        }
+
+        /* Secondary Timeline Styles */
+        #overview-container {
+            margin-top: 10px;
+            background-color: #fff;
+            border-top: 1px solid #dee2e6;
+            border-bottom: 1px solid #dee2e6;
+            border-left: none;
+            border-right: none;
+            border-radius: 0;
+            padding: 10px 0; /* vertical padding only to preserve horizontal alignment */
+        }
+        
+        #overview-chart {
+            background-color: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+            border-bottom: 1px solid #e9ecef;
+            border-left: none;
+            border-right: none;
+            border-radius: 0;
+        }
+        
+        .brush .selection { /* hide rectangle, we'll draw our own UI */
+            fill: transparent;
+            stroke: none;
+            stroke-width: 0;
+            rx: 0;
+        }
+        
+        .brush .handle { /* hide default handles */
+            display: none;
+        }
+        
+        /* Custom overview brush UI */
+        .overview-window-line { stroke: #3490dc; stroke-width: 3px; }
+        .overview-handle { fill: #ffffff; stroke: #3490dc; stroke-width: 2px; cursor: ew-resize; }
+        .overview-window-grab { fill: transparent; cursor: grab; }
+        
+        .overview-axis {
+            font-size: 10px;
+        }
+        
+        .overview-axis .tick text {
+            fill: #6c757d;
+        }
+        
+        .overview-axis .domain {
+            stroke: #adb5bd;
+        }
+        
+        .overview-density-bar {
+            fill: #6c757d;
+            opacity: 0.6;
+        }
+        
+        .overview-title {
+            font-size: 12px;
+            font-weight: bold;
+            fill: #495057;
+            text-anchor: middle;
+        }
+
+    </style>
+</head>
+<body>
+    <h1>IP Connection Analysis</h1>
+    <div id="main-layout">
+      <div id="chart-column">
+        <div id="chart-container">
+            <div id="chart"></div>
+            <div id="loadingMessage">Please select a CSV data file generated by `tcp_data_loader.py`.</div>
+        </div>
+        <div id="overview-container" style="display: none;">
+            <div style="text-align: center; margin-bottom: 5px; color: #6c757d; font-size: 12px; font-weight: bold;">
+                Timeline Overview - Drag to Navigate
+            </div>
+            <div id="overview-chart"></div>
+        </div>
+      </div>
+      <aside id="sidebar">
+        <div class="controls">
+        <div class="control-group">
+            <label for="dataFile">Data File</label>
+            <input type="file" id="dataFile" accept=".csv" />
+        </div>
+        <div class="control-group">
+            <label>IP Addresses</label>
+            <div id="ipSelector" style="max-height: 200px; overflow-y: auto; border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px;">
+                <div style="margin-bottom: 10px;">
+                    <input type="text" id="ipSearch" placeholder="Search IP addresses..." style="width: 100%; padding: 5px; margin-bottom: 10px; border: 1px solid #ced4da; border-radius: 3px;">
+                    <button id="selectAllIPs" style="margin-right: 10px;">Select All</button>
+                    <button id="clearAllIPs">Clear All</button>
+                </div>
+                <div id="ipCheckboxes"></div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>TCP Flag Statistics</label>
+            <div id="flagStats" style="min-width: 200px; border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <div style="color: #666;">No data loaded</div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>IP Statistics</label>
+            <div id="ipStats" style="min-width: 250px; max-height: 200px; overflow-y: auto; border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <div style="color: #666;">Select IPs to view statistics</div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>TCP Flow Visualization</label>
+            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <label style="display: flex; align-items: center; margin-bottom: 5px;">
+                    <input type="checkbox" id="showTcpFlows" style="margin-right: 8px;" checked>
+                    Show TCP Flow Packets
+                </label>
+                <label style="display: flex; align-items: center; margin-bottom: 5px;">
+                    <input type="checkbox" id="showEstablishment" style="margin-right: 8px;" checked>
+                    Show Establishment Phase
+                </label>
+                <label style="display: flex; align-items: center; margin-bottom: 5px;">
+                    <input type="checkbox" id="showDataTransfer" style="margin-right: 8px;" checked>
+                    Show Data Transfer Phase
+                </label>
+                <label style="display: flex; align-items: center; margin-bottom: 5px;">
+                    <input type="checkbox" id="showClosing" style="margin-right: 8px;" checked>
+                    Show Closing Phase
+                </label>
+                <div id="tcpFlowStats" style="color: #666; font-size: 11px; margin-top: 10px;">
+                    No TCP flows detected
+                </div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>Flow Selection</label>
+            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <div id="invalidLegendPanel" style="min-width: 220px; border: 1px solid #e9ecef; padding: 8px; background: #fff; border-radius: 4px; font-size: 12px; margin-bottom: 10px;">
+                    <div style="color: #666;">Invalid flow legend will appear here</div>
+                </div>
+                <div id="closingLegendPanel" style="min-width: 220px; border: 1px solid #e9ecef; padding: 8px; background: #fff; border-radius: 4px; font-size: 12px; margin-bottom: 10px;">
+                    <div style="color: #666;">Closing legend will appear here</div>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <input type="text" id="flowSearch" placeholder="Search flows..." style="width: 100%; padding: 5px; margin-bottom: 10px; border: 1px solid #ced4da; border-radius: 3px;">
+                    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                        <button id="selectAllFlows" style="padding: 4px 8px; font-size: 11px;">Select All</button>
+                        <button id="clearAllFlows" style="padding: 4px 8px; font-size: 11px;">Clear All</button>
+                        <button id="selectEstablishedFlows" style="padding: 4px 8px; font-size: 11px;">Established Only</button>
+                    </div>
+                </div>
+                <div id="flowList" style="max-height: 300px; overflow-y: auto; border: 1px solid #e9ecef; border-radius: 3px; padding: 5px;">
+                    <div style="color: #666; text-align: center; padding: 20px;">No flows to display</div>
+                </div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>Ground Truth Events</label>
+            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <label style="display: flex; align-items: center; margin-bottom: 5px;">
+                    <input type="checkbox" id="showGroundTruth" style="margin-right: 8px;">
+                    Show Ground Truth Event Boxes
+                </label>
+                <div id="groundTruthStats" style="color: #666; font-size: 11px; margin-top: 5px;">
+                    Loading ground truth data...
+                </div>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>Rendering</label>
+            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                    <input type="checkbox" id="toggleBinning" checked>
+                    <span>Use binning (aggregate packets)</span>
+                </label>
+                <div style="color:#666; font-size:11px; margin-top:6px;">
+                    When off, shows individual packets (slower on large ranges).
+                </div>
+            </div>
+        </div>
+        <button id="resetView">Reset View</button>
+        </div>
+      </aside>
+    </div>
+    <div id="tooltip" class="tooltip" style="display: none;"></div>
+
+    <script type="module" src="./ip_arc_diagram.js"></script>
+</body>
+</html>
