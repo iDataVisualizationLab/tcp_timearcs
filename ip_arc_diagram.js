@@ -342,6 +342,8 @@ window.addEventListener('DOMContentLoaded', () => {
         sbRenderInvalidLegend: (panel, html, title) => sbRenderInvalidLegend(panel, html, title),
         sbRenderClosingLegend: (panel, html, title) => sbRenderClosingLegend(panel, html, title),
         makeConnectionKey: (a,b,c,d) => makeConnectionKey(a,b,c,d),
+        // Allow overview legend toggles to affect the arc graph immediately
+        applyInvalidReasonFilter: () => applyInvalidReasonFilter(),
         hiddenInvalidReasons,
         hiddenCloseTypes,
         GLOBAL_BIN_COUNT,
@@ -551,7 +553,18 @@ function applyInvalidReasonFilter() {
             let r = f.invalidReason;
             if (!r && (f.closeType === 'invalid' || f.state === 'invalid')) r = 'unknown_invalid';
             reasonByKey.set(key, r || null);
-            if (f.closeType) closeTypeByKey.set(key, f.closeType);
+            // Closing-type visibility: exclude invalid flows from 'unknown'
+            // Only map to 'unknown' if NOT invalid and not graceful/abortive
+            const isInvalid = !!r || f.closeType === 'invalid' || f.state === 'invalid';
+            let ct = null;
+            if (!isInvalid) {
+                if (f.closeType === 'graceful' || f.closeType === 'abortive') {
+                    ct = f.closeType;
+                } else {
+                    ct = 'unknown';
+                }
+            }
+            closeTypeByKey.set(key, ct);
         }
     }
 

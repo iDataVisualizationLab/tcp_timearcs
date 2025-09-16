@@ -18,6 +18,7 @@ let sbRenderClosingLegendRef = null;
 let makeConnectionKeyRef = null;
 let hiddenInvalidReasonsRef = null;
 let hiddenCloseTypesRef = null;
+let applyInvalidReasonFilterRef = null; // callback from main to hide/show dots/arcs
 
 // Config shared with main
 let GLOBAL_BIN_COUNT = 600;
@@ -38,6 +39,7 @@ export function initOverview(options) {
     makeConnectionKeyRef = options.makeConnectionKey;
     hiddenInvalidReasonsRef = options.hiddenInvalidReasons;
     hiddenCloseTypesRef = options.hiddenCloseTypes;
+    applyInvalidReasonFilterRef = options.applyInvalidReasonFilter;
     GLOBAL_BIN_COUNT = options.GLOBAL_BIN_COUNT ?? GLOBAL_BIN_COUNT;
     flagColors = options.flagColors || {};
     flowColors = options.flowColors || {};
@@ -379,6 +381,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                         const setRef = hiddenInvalidReasonsRef;
                         if (setRef.has(reason)) setRef.delete(reason); else setRef.add(reason);
                         try { updateOverviewInvalidVisibility(); } catch {}
+                        // Also apply to main arc graph without rebinning
+                        try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
                     });
                     el.addEventListener('mouseover', (event) => {
                         tooltipSel.style('display', 'block').html(`<b>${invalidLabels[reason] || 'Invalid'}</b>`);
@@ -398,9 +402,11 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         const cpanel = document.getElementById('closingLegendPanel');
         if (cpanel) {
             const flowsAll = Array.isArray(getCurrentFlowsRef()) ? getCurrentFlowsRef() : [];
+            const isInvalid = (f) => f && (f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason);
             const graceful = flowsAll.filter(f => f && f.closeType === 'graceful').length;
             const abortive = flowsAll.filter(f => f && f.closeType === 'abortive').length;
-            const unknown = flowsAll.filter(f => f && (!f.closeType || (f.closeType !== 'graceful' && f.closeType !== 'abortive'))).length;
+            // Unknown = not invalid AND not graceful/abortive
+            const unknown = flowsAll.filter(f => f && !isInvalid(f) && (!f.closeType || (f.closeType !== 'graceful' && f.closeType !== 'abortive'))).length;
             const entries = [
                 { type: 'graceful', label: 'Graceful closes', color: ((flowColors.closing && flowColors.closing.graceful) || '#8e44ad'), count: graceful },
                 { type: 'abortive', label: 'Abortive (RST)', color: ((flowColors.closing && flowColors.closing.abortive) || '#c0392b'), count: abortive },
@@ -422,6 +428,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                     const setRef = hiddenCloseTypesRef;
                     if (setRef.has(t)) setRef.delete(t); else setRef.add(t);
                     try { updateOverviewInvalidVisibility(); } catch {}
+                    // Also apply to main arc graph without rebinning
+                    try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
                 });
             });
         }
