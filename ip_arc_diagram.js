@@ -120,6 +120,85 @@ let globalMaxBinCount = 1;
 // User toggle: binning on/off
 let useBinning = true;
 
+// Draw a circle-size legend (bottom-right) for smallest/middle/largest counts
+function drawSizeLegend() {
+    try {
+        if (!svg || !width || !height) return;
+        // Remove previous legend if any
+        svg.select('.size-legend').remove();
+
+        const maxCount = Math.max(1, globalMaxBinCount);
+        const midCount = Math.max(1, Math.round(maxCount / 2));
+        const values = [1, midCount, maxCount];
+
+        const rScale = d3.scaleSqrt().domain([1, maxCount]).range([RADIUS_MIN, RADIUS_MAX]);
+        const radii = values.map(v => rScale(v));
+        const maxR = Math.max(...radii, RADIUS_MIN);
+
+        // Layout constants
+        const padding = 8;
+        const labelGap = 32; // top headroom for title + labels
+        const legendWidth = maxR * 2 + padding * 2; // compact width
+        const legendHeight = 2 * maxR + padding + (padding + labelGap); // space for title + labels
+
+        const legendX = Math.max(0, width - legendWidth - 12);
+        const legendY = Math.max(0, height - legendHeight - 12);
+
+        const g = svg.append('g').attr('class', 'size-legend').attr('transform', `translate(${legendX},${legendY})`);
+
+        // Background
+        g.append('rect')
+            .attr('x', 0)
+            .attr('y', 0)
+            .attr('rx', 6)
+            .attr('ry', 6)
+            .attr('width', legendWidth)
+            .attr('height', legendHeight)
+            .style('fill', '#fff')
+            .style('opacity', 0.85)
+            .style('stroke', '#ccc');
+
+        // Title
+        g.append('text')
+            .attr('x', legendWidth / 2)
+            .attr('y', padding + 10)
+            .attr('text-anchor', 'middle')
+            .style('font-size', '12px')
+            .style('font-weight', '600')
+            .style('fill', '#333')
+            .text('Circle Size');
+
+        // Baseline at the bottom inside the box
+        const innerTop = padding + labelGap; // extra top room for labels
+        const baseline = innerTop + 2 * maxR;
+        const cx = padding + maxR; // center x for all circles
+
+        // Draw nested circles (bottom-aligned), no fill. Draw largest first.
+        const order = [2, 1, 0]; // indices for [max, mid, min]
+        order.forEach((idx) => {
+            const v = values[idx];
+            const r = Math.max(RADIUS_MIN, radii[idx]);
+            const cy = baseline - r; // bottom-aligned
+
+            g.append('circle')
+                .attr('cx', cx)
+                .attr('cy', cy)
+                .attr('r', r)
+                .style('fill', 'none')
+                .style('stroke', '#555');
+
+            // Label centered above each circle
+            g.append('text')
+                .attr('x', cx)
+                .attr('y', cy - r - 4)
+                .attr('text-anchor', 'middle')
+                .style('font-size', '12px')
+                .style('fill', '#333')
+                .text(v);
+        });
+    } catch (_) { /* ignore legend draw errors */ }
+}
+
 // Global line path generator function updated to draw curved arcs
 function arcPathGenerator(d) {
     if (!xScale || !ipPositions) return "";
@@ -1021,6 +1100,8 @@ function recomputeGlobalMaxBinCountFromVisibleDots() {
     mainGroup.selectAll('.direction-dot')
         .attr('r', d => (d && d.binned && d.count > 1) ? scale(d.count) : RADIUS_MIN)
         .attr('data-orig-r', d => (d && d.binned && d.count > 1) ? scale(d.count) : RADIUS_MIN);
+    // Keep the size legend in sync with the current scale
+    try { drawSizeLegend(); } catch (_) {}
 }
         
 // Delegated to sidebar.js
@@ -2494,6 +2575,8 @@ function visualizeTimeArcs(packets) {
     if (dynamicLayer) dynamicLayer.style("display", "none");
 
     updateTcpFlowPacketsGlobal();
+    // Draw size legend once initial dots and scales are ready
+    try { drawSizeLegend(); } catch (_) {}
 
     const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked'))
         .map(cb => cb.value);
