@@ -32,7 +32,13 @@
             flex: 1 1 auto;
             min-width: 0; /* allow flex children to shrink properly */
             height: 100%;
-            overflow-y: auto; /* independent scroll */
+            display: flex;
+            flex-direction: column;
+        }
+        #chart-container {
+            flex: 1 1 auto;
+            min-width: 0;
+            overflow-y: auto; /* chart area scrolls independently */
             -webkit-overflow-scrolling: touch;
         }
         #sidebar {
@@ -231,6 +237,7 @@
             border-right: none;
             border-radius: 0;
             padding: 10px 0; /* vertical padding only to preserve horizontal alignment */
+            flex: 0 0 auto; /* keep overview fixed at bottom of chart column */
         }
         
         #overview-chart {

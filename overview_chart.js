@@ -67,7 +67,11 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     const timeBinSize = totalRange / binCount;
 
     const allFlows = Array.isArray(getCurrentFlowsRef()) ? getCurrentFlowsRef() : [];
-    const flows = allFlows.filter(f => f && (f.closeType === 'invalid' || f.state === 'invalid' || f.invalidReason));
+    // Separate invalid-like flows for the bottom histogram
+    const invalidFlows = allFlows.filter(f => f && (f.closeType === 'invalid' || f.state === 'invalid' || f.invalidReason));
+    // Separate closing types for the top histogram
+    const closingTypes = ['graceful', 'abortive'];
+    const closingFlows = allFlows.filter(f => f && closingTypes.includes(f.closeType));
 
     const invalidLabels = {
         'invalid_ack': 'Invalid ACK',
@@ -112,7 +116,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     const axisY = overviewHeight - 30;
 
     const presentReasonsSet = new Set();
-    for (const f of flows) {
+    for (const f of invalidFlows) {
         if (f && (typeof f.startTime === 'number')) {
             const r = getInvalidReason(f);
             if (r) presentReasonsSet.add(r);
@@ -126,8 +130,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     const rowHeight = rowsHeight / rows;
     const reasonY = new Map(reasons.map((r, i) => [r, (i + 0.5) * rowHeight]));
 
+    // Build binned maps for invalid reasons (bottom) and closing types (top)
     const binReasonMap = new Map();
-    for (const f of flows) {
+    for (const f of invalidFlows) {
         if (!f || typeof f.startTime !== 'number') continue;
         const reason = getInvalidReason(f);
         if (!reason) continue;
@@ -141,21 +146,59 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         arr.push(f);
         m.set(reason, arr);
     }
+    // Build bins for closing types (top histogram)
+    const binCloseMap = new Map();
+    for (const f of closingFlows) {
+        if (!f || typeof f.startTime !== 'number') continue;
+        const t = f.closeType;
+        if (!closingTypes.includes(t)) continue;
+        const idx = Math.min(
+            binCount - 1,
+            Math.max(0, Math.floor((f.startTime - timeExtent[0]) / timeBinSize))
+        );
+        let m = binCloseMap.get(idx);
+        if (!m) { m = new Map(); binCloseMap.set(idx, m); }
+        const arr = m.get(t) || [];
+        arr.push(f);
+        m.set(t, arr);
+    }
 
-    let maxBinTotal = 0;
-    const binTotals = new Map();
+    // Compute per-bin totals and global max per direction
+    let maxBinTotalInvalid = 0;
+    const binTotalsInvalid = new Map();
     for (let i = 0; i < binCount; i++) {
         const m = binReasonMap.get(i);
         let total = 0;
         if (m) for (const arr of m.values()) total += arr.length;
-        binTotals.set(i, total);
-        if (total > maxBinTotal) maxBinTotal = total;
+        binTotalsInvalid.set(i, total);
+        if (total > maxBinTotalInvalid) maxBinTotalInvalid = total;
     }
-    maxBinTotal = Math.max(1, maxBinTotal);
+    maxBinTotalInvalid = Math.max(1, maxBinTotalInvalid);
 
-    const chartHeight = Math.max(10, axisY - 6);
+    let maxBinTotalClosing = 0;
+    const binTotalsClosing = new Map();
+    for (let i = 0; i < binCount; i++) {
+        const m = binCloseMap.get(i);
+        let total = 0;
+        if (m) for (const arr of m.values()) total += arr.length;
+        binTotalsClosing.set(i, total);
+        if (total > maxBinTotalClosing) maxBinTotalClosing = total;
+    }
+    maxBinTotalClosing = Math.max(1, maxBinTotalClosing);
 
-    const stackData = [];
+    // Layout heights
+    const chartHeightUp = Math.max(10, axisY - 6);
+    const brushTopY = overviewHeight - 4; // top of brush selection area
+    const chartHeightDown = Math.max(6, brushTopY - axisY - 4); // keep a tiny gap from brush
+
+    // Colors for closing types (top)
+    const closeColors = {
+        graceful: '#8e44ad',
+        abortive: '#c0392b'
+    };
+
+    // Prepare render data for both directions
+    const segments = [];
     for (let i = 0; i < binCount; i++) {
         const binStartTime = timeExtent[0] + i * timeBinSize;
         const binEndTime = binStartTime + timeBinSize;
@@ -163,57 +206,86 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         const x1 = overviewXScale(binEndTime);
         const widthPx = Math.max(1, x1 - x0);
         const baseX = x0;
+
+        // Upward stacking: closing types
         let yTop = axisY;
-        const m = binReasonMap.get(i) || new Map();
-        const total = binTotals.get(i) || 0;
-        if (total === 0) continue;
-        for (const reason of reasons) {
-            const arr = m.get(reason) || [];
-            const count = arr.length;
-            if (count === 0) continue;
-            const h = (count / maxBinTotal) * chartHeight;
-            yTop -= h;
-            stackData.push({ x: baseX, y: yTop, width: widthPx, height: h, count, reason, flows: arr, binIndex: i });
+        const mTop = binCloseMap.get(i) || new Map();
+        const totalTop = binTotalsClosing.get(i) || 0;
+        if (totalTop > 0) {
+            for (const t of closingTypes) {
+                const arr = mTop.get(t) || [];
+                const count = arr.length;
+                if (count === 0) continue;
+                const h = (count / maxBinTotalClosing) * chartHeightUp;
+                yTop -= h;
+                segments.push({
+                    kind: 'closing', closeType: t, reason: null,
+                    x: baseX, y: yTop, width: widthPx, height: h,
+                    count, flows: arr, binIndex: i
+                });
+            }
+        }
+
+        // Downward stacking: invalid reasons
+        let yBottom = axisY;
+        const mBot = binReasonMap.get(i) || new Map();
+        const totalBot = binTotalsInvalid.get(i) || 0;
+        if (totalBot > 0) {
+            for (const reason of reasons) {
+                const arr = mBot.get(reason) || [];
+                const count = arr.length;
+                if (count === 0) continue;
+                const h = (count / maxBinTotalInvalid) * chartHeightDown;
+                const y = yBottom; // start at baseline and grow downward
+                yBottom += h;
+                segments.push({
+                    kind: 'invalid', reason, closeType: null,
+                    x: baseX, y, width: widthPx, height: h,
+                    count, flows: arr, binIndex: i
+                });
+            }
         }
     }
 
+    // Render combined segments
     overviewSvg.selectAll('.overview-stack-segment')
-        .data(stackData)
+        .data(segments)
         .enter().append('rect')
         .attr('class', 'overview-stack-segment')
         .attr('x', d => d.x)
         .attr('y', d => d.y)
         .attr('width', d => d.width)
         .attr('height', d => Math.max(1, d.height))
-        .attr('fill', d => invalidFlowColors[d.reason] || '#6c757d')
+        .attr('fill', d => d.kind === 'invalid' ? (invalidFlowColors[d.reason] || '#6c757d') : (closeColors[d.closeType] || '#6c757d'))
         .attr('stroke', '#ffffff')
         .attr('stroke-width', 0.5)
         .attr('vector-effect', 'non-scaling-stroke')
         .style('cursor', 'pointer')
         .on('mouseover', (event, d) => {
-            const sx = 3.0;
-            const targetSy = 1.8;
-            const total = (binTotals && binTotals.get) ? (binTotals.get(d.binIndex) || 0) : 0;
-            const denom = Math.max(1, maxBinTotal);
-            const totalHeight = (total / denom) * chartHeight;
+            const sx = 5.0; // horizontal magnification on hover
+            const targetSy = 3.0; // vertical magnification target on hover
+            const upTotal = (binTotalsClosing && binTotalsClosing.get) ? (binTotalsClosing.get(d.binIndex) || 0) : 0;
+            const downTotal = (binTotalsInvalid && binTotalsInvalid.get) ? (binTotalsInvalid.get(d.binIndex) || 0) : 0;
+            const upHeight = (upTotal / Math.max(1, maxBinTotalClosing)) * chartHeightUp;
+            const downHeight = (downTotal / Math.max(1, maxBinTotalInvalid)) * chartHeightDown;
             let sy = targetSy;
-            if (totalHeight > 0) {
-                sy = Math.max(1, Math.min(targetSy, chartHeight / totalHeight));
-            }
-            overviewSvg.selectAll('.overview-stack-segment')
-                .filter(s => s.binIndex === d.binIndex)
-                .transition().duration(140)
-                .attr('transform', s => {
-                    const cx = s.x + s.width / 2;
-                    const axisY = overviewHeight - 30;
-                    return `translate(${cx},${axisY}) scale(${sx},${sy}) translate(${-cx},${-axisY})`;
-                })
-                .attr('stroke-width', 1.8);
+            if (upHeight > 0) sy = Math.min(sy, chartHeightUp / upHeight);
+            if (downHeight > 0) sy = Math.min(sy, chartHeightDown / downHeight);
+                sy = Math.max(1.2, sy);
+                overviewSvg.selectAll('.overview-stack-segment')
+                    .filter(s => s.binIndex === d.binIndex)
+                    .transition().duration(200)
+                    .attr('transform', s => {
+                        const cx = s.x + s.width / 2;
+                        const axisY = overviewHeight - 30;
+                        return `translate(${cx},${axisY}) scale(${sx},${sy}) translate(${-cx},${-axisY})`;
+                    })
+                    .attr('stroke-width', 3.0);
         })
         .on('mouseout', (event, d) => {
             overviewSvg.selectAll('.overview-stack-segment')
                 .filter(s => s.binIndex === d.binIndex)
-                .transition().duration(140)
+                .transition().duration(180)
                 .attr('transform', null)
                 .attr('stroke-width', 0.5);
         })
@@ -238,7 +310,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             applyZoomDomainRef([a, b], 'flow');
             try { updateBrushFromZoom(); } catch {}
 
-            const bucket = binReasonMap.get(d.binIndex) || new Map();
+            const bucket = (d.kind === 'invalid') ? (binReasonMap.get(d.binIndex) || new Map())
+                                                 : (binCloseMap.get(d.binIndex) || new Map());
             const binFlows = Array.from(bucket.values()).flat();
             if (!binFlows.length) return;
             try {
@@ -262,7 +335,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             }
         })
         .append('title')
-        .text(d => `${d.count} flow(s)`);
+        .text(d => `${d.count} ${d.kind === 'invalid' ? 'invalid' : d.closeType} flow(s)`);
 
     // Legends
     try {
@@ -277,7 +350,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 'unknown_invalid'
             ];
             const totalsByReason = new Map(legendReasons.map(r => [r, 0]));
-            for (const f of flows) {
+            for (const f of invalidFlows) {
                 let r = getInvalidReason(f);
                 if (!r) r = 'unknown_invalid';
                 if (totalsByReason.has(r)) totalsByReason.set(r, totalsByReason.get(r) + 1);
@@ -371,7 +444,18 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         .on('brush end', brushed);
 
     overviewSvg.append('g').attr('class', 'brush').call(overviewBrush);
-    overviewSvg.select('.brush').call(overviewBrush.move, [0, overviewWidth]);
+    // Initialize brush selection to match the provided timeExtent domain
+    try {
+        const x0 = Math.max(0, Math.min(overviewWidth, overviewXScale(timeExtent[0])));
+        const x1 = Math.max(0, Math.min(overviewWidth, overviewXScale(timeExtent[1])));
+        const brushSel = overviewSvg.select('.brush');
+        if (brushSel && !brushSel.empty()) {
+            overviewSvg.select('.brush').call(overviewBrush.move, [x0, x1]);
+        }
+    } catch (e) {
+        // Fallback to full selection if computation fails
+        try { overviewSvg.select('.brush').call(overviewBrush.move, [0, overviewWidth]); } catch(_) {}
+    }
 
     const lineY = overviewHeight - 1;
     if (!overviewSvg.select('.overview-custom').node()) {
@@ -403,6 +487,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     }
 
     try { updateOverviewInvalidVisibility(); } catch {}
+
+    // Ensure brush visuals reflect current zoom domain after creating overview
+    try { updateBrushFromZoom(); } catch (_) {}
 }
 
 export function updateBrushFromZoom() {
@@ -467,9 +554,29 @@ function brushed(event) {
 
 export function updateOverviewInvalidVisibility() {
     if (!overviewSvg) return;
-    const setHidden = hiddenInvalidReasonsRef;
-    const nothingHidden = !setHidden || setHidden.size === 0;
+    const hiddenReasons = hiddenInvalidReasonsRef;
+    const hiddenCloses = hiddenCloseTypesRef;
+    const noReasonHidden = !hiddenReasons || hiddenReasons.size === 0;
+    const noCloseHidden = !hiddenCloses || hiddenCloses.size === 0;
     overviewSvg.selectAll('.overview-stack-segment')
-        .style('display', d => (nothingHidden || !d || !d.reason || !setHidden.has(d.reason)) ? null : 'none')
-        .style('opacity', d => (nothingHidden || !d || !d.reason || !setHidden.has(d.reason)) ? null : 0);
+        .style('display', d => {
+            if (!d) return null;
+            if (d.kind === 'invalid') {
+                return (noReasonHidden || !d.reason || !hiddenReasons.has(d.reason)) ? null : 'none';
+            }
+            if (d.kind === 'closing') {
+                return (noCloseHidden || !d.closeType || !hiddenCloses.has(d.closeType)) ? null : 'none';
+            }
+            return null;
+        })
+        .style('opacity', d => {
+            if (!d) return null;
+            if (d.kind === 'invalid') {
+                return (noReasonHidden || !d.reason || !hiddenReasons.has(d.reason)) ? null : 0;
+            }
+            if (d.kind === 'closing') {
+                return (noCloseHidden || !d.closeType || !hiddenCloses.has(d.closeType)) ? null : 0;
+            }
+            return null;
+        });
 }

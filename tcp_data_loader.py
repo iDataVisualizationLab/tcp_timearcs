@@ -93,14 +93,14 @@ def detect_tcp_flows(records, selected_ips=None):
 
     def update_ip_stats(ip_from, ip_to, length, ts):
         s = ip_stats[ip_from]
-        s['sent_packets'] += 1
-        s['sent_bytes'] += max(0, int(length or 0))
+        s['sent_packets'] = (s.get('sent_packets') or 0) + 1
+        s['sent_bytes'] = (s.get('sent_bytes') or 0) + max(0, int(length or 0))
         s['first_ts'] = ts if s['first_ts'] is None else min(s['first_ts'], ts)
         s['last_ts'] = ts if s['last_ts'] is None else max(s['last_ts'], ts)
 
         r = ip_stats[ip_to]
-        r['recv_packets'] += 1
-        r['recv_bytes'] += max(0, int(length or 0))
+        r['recv_packets'] = (r.get('recv_packets') or 0) + 1
+        r['recv_bytes'] = (r.get('recv_bytes') or 0) + max(0, int(length or 0))
         r['first_ts'] = ts if r['first_ts'] is None else min(r['first_ts'], ts)
         r['last_ts'] = ts if r['last_ts'] is None else max(r['last_ts'], ts)
 
@@ -120,15 +120,15 @@ def detect_tcp_flows(records, selected_ips=None):
                 'last_ts': ts
             }
             ip_pair_map[key] = entry
-        entry['packet_count'] += 1
+        entry['packet_count'] = (entry.get('packet_count') or 0) + 1
         entry['first_ts'] = min(entry['first_ts'], ts)
         entry['last_ts'] = max(entry['last_ts'], ts)
         if str(src_ip) == a:
-            entry['a_to_b_packets'] += 1
-            entry['a_to_b_bytes'] += max(0, int(length or 0))
+            entry['a_to_b_packets'] = (entry.get('a_to_b_packets') or 0) + 1
+            entry['a_to_b_bytes'] = (entry.get('a_to_b_bytes') or 0) + max(0, int(length or 0))
         else:
-            entry['b_to_a_packets'] += 1
-            entry['b_to_a_bytes'] += max(0, int(length or 0))
+            entry['b_to_a_packets'] = (entry.get('b_to_a_packets') or 0) + 1
+            entry['b_to_a_bytes'] = (entry.get('b_to_a_bytes') or 0) + max(0, int(length or 0))
 
     # Apply HTML-style filtering if selected_ips provided
     filtered_records = records
