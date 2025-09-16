@@ -22,6 +22,7 @@ let hiddenCloseTypesRef = null;
 // Config shared with main
 let GLOBAL_BIN_COUNT = 600;
 let flagColors = {};
+let flowColors = {};
 
 export function initOverview(options) {
     d3Ref = options.d3;
@@ -39,6 +40,7 @@ export function initOverview(options) {
     hiddenCloseTypesRef = options.hiddenCloseTypes;
     GLOBAL_BIN_COUNT = options.GLOBAL_BIN_COUNT ?? GLOBAL_BIN_COUNT;
     flagColors = options.flagColors || {};
+    flowColors = options.flowColors || {};
 }
 
 export function createOverviewChart(packets, { timeExtent, width, margins }) {
@@ -89,13 +91,14 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         'invalid_synack': 'The SYN+ACK response was invalid (e.g., unexpected seq/ack numbers or incorrect flag combination).',
         'unknown_invalid': 'The flow was marked invalid, but no specific root cause was classified.'
     };
+    // Build invalid reason colors, prefer explicit flowColors.invalid overrides
     const invalidFlowColors = {
-        'invalid_ack': d3.color(flagColors['ACK'] || '#27ae60').darker(0.5).formatHex(),
-        'invalid_synack': d3.color(flagColors['SYN+ACK'] || '#f39c12').darker(0.5).formatHex(),
-        'rst_during_handshake': d3.color(flagColors['RST'] || '#34495e').darker(0.5).formatHex(),
-        'incomplete_no_synack': d3.color(flagColors['SYN+ACK'] || '#f39c12').brighter(0.5).formatHex(),
-        'incomplete_no_ack': d3.color(flagColors['ACK'] || '#27ae60').brighter(0.5).formatHex(),
-        'unknown_invalid': d3.color(flagColors['OTHER'] || '#bdc3c7').darker(0.5).formatHex()
+        'invalid_ack': (flowColors.invalid && flowColors.invalid['invalid_ack']) || d3.color(flagColors['ACK'] || '#27ae60').darker(0.5).formatHex(),
+        'invalid_synack': (flowColors.invalid && flowColors.invalid['invalid_synack']) || d3.color(flagColors['SYN+ACK'] || '#f39c12').darker(0.5).formatHex(),
+        'rst_during_handshake': (flowColors.invalid && flowColors.invalid['rst_during_handshake']) || d3.color(flagColors['RST'] || '#34495e').darker(0.5).formatHex(),
+        'incomplete_no_synack': (flowColors.invalid && flowColors.invalid['incomplete_no_synack']) || d3.color(flagColors['SYN+ACK'] || '#f39c12').brighter(0.5).formatHex(),
+        'incomplete_no_ack': (flowColors.invalid && flowColors.invalid['incomplete_no_ack']) || d3.color(flagColors['ACK'] || '#27ae60').brighter(0.5).formatHex(),
+        'unknown_invalid': (flowColors.invalid && flowColors.invalid['unknown_invalid']) || d3.color(flagColors['OTHER'] || '#bdc3c7').darker(0.5).formatHex()
     };
     const invalidOrder = [
         'invalid_ack',
@@ -193,8 +196,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
 
     // Colors for closing types (top)
     const closeColors = {
-        graceful: '#8e44ad',
-        abortive: '#c0392b'
+        graceful: (flowColors.closing && flowColors.closing.graceful) || '#8e44ad',
+        abortive: (flowColors.closing && flowColors.closing.abortive) || '#c0392b'
     };
 
     // Prepare render data for both directions
@@ -262,8 +265,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         .attr('vector-effect', 'non-scaling-stroke')
         .style('cursor', 'pointer')
         .on('mouseover', (event, d) => {
-            const sx = 5.0; // horizontal magnification on hover
-            const targetSy = 3.0; // vertical magnification target on hover
+            const sx = 3.0; // horizontal magnification on hover
+            const targetSy = 1.8; // vertical magnification target on hover
             const upTotal = (binTotalsClosing && binTotalsClosing.get) ? (binTotalsClosing.get(d.binIndex) || 0) : 0;
             const downTotal = (binTotalsInvalid && binTotalsInvalid.get) ? (binTotalsInvalid.get(d.binIndex) || 0) : 0;
             const upHeight = (upTotal / Math.max(1, maxBinTotalClosing)) * chartHeightUp;
@@ -271,16 +274,16 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             let sy = targetSy;
             if (upHeight > 0) sy = Math.min(sy, chartHeightUp / upHeight);
             if (downHeight > 0) sy = Math.min(sy, chartHeightDown / downHeight);
-                sy = Math.max(1.2, sy);
+                sy = Math.max(1.0, sy);
                 overviewSvg.selectAll('.overview-stack-segment')
                     .filter(s => s.binIndex === d.binIndex)
-                    .transition().duration(200)
+                    .transition().duration(140)
                     .attr('transform', s => {
                         const cx = s.x + s.width / 2;
                         const axisY = overviewHeight - 30;
                         return `translate(${cx},${axisY}) scale(${sx},${sy}) translate(${-cx},${-axisY})`;
                     })
-                    .attr('stroke-width', 3.0);
+                    .attr('stroke-width', 1.8);
         })
         .on('mouseout', (event, d) => {
             overviewSvg.selectAll('.overview-stack-segment')
@@ -310,12 +313,11 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             applyZoomDomainRef([a, b], 'flow');
             try { updateBrushFromZoom(); } catch {}
 
-            const bucket = (d.kind === 'invalid') ? (binReasonMap.get(d.binIndex) || new Map())
-                                                 : (binCloseMap.get(d.binIndex) || new Map());
-            const binFlows = Array.from(bucket.values()).flat();
-            if (!binFlows.length) return;
+            // Select only the flows belonging to the clicked segment (not the whole bin)
+            const segmentFlows = Array.isArray(d.flows) ? d.flows : [];
+            if (!segmentFlows.length) return;
             try {
-                const idsToSelect = new Set(binFlows.map(f => String(f.id)));
+                const idsToSelect = new Set(segmentFlows.map(f => String(f.id)));
                 const selectedFlowIds = getSelectedFlowIdsRef();
                 selectedFlowIds.clear();
                 idsToSelect.forEach(id => selectedFlowIds.add(id));
@@ -400,8 +402,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             const abortive = flowsAll.filter(f => f && f.closeType === 'abortive').length;
             const unknown = flowsAll.filter(f => f && (!f.closeType || (f.closeType !== 'graceful' && f.closeType !== 'abortive'))).length;
             const entries = [
-                { type: 'graceful', label: 'Graceful closes', color: '#8e44ad', count: graceful },
-                { type: 'abortive', label: 'Abortive (RST)', color: '#c0392b', count: abortive },
+                { type: 'graceful', label: 'Graceful closes', color: ((flowColors.closing && flowColors.closing.graceful) || '#8e44ad'), count: graceful },
+                { type: 'abortive', label: 'Abortive (RST)', color: ((flowColors.closing && flowColors.closing.abortive) || '#c0392b'), count: abortive },
                 { type: 'unknown', label: 'Unknown', color: '#6c757d', count: unknown }
             ];
             const total = graceful + abortive + unknown;

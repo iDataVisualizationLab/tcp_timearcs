@@ -226,10 +226,22 @@ function arcPathGenerator(d) {
     const cy2 = y2;
     return `M${x},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x},${y2}`;
 }
-const flagColors = {
+// TCP flag colors, now loaded from flag_colors.json with defaults
+const defaultFlagColors = {
     'SYN': '#e74c3c', 'SYN+ACK': '#f39c12', 'ACK': '#27ae60',
     'FIN': '#8e44ad', 'FIN+ACK': '#9b59b6', 'RST': '#34495e',
     'PSH+ACK': '#3498db', 'ACK+RST': '#c0392b', 'OTHER': '#bdc3c7'
+};
+let flagColors = { ...defaultFlagColors };
+// Flow-related colors (closing types and invalid reasons) loaded from flow_colors.json
+let flowColors = {
+    closing: {
+        graceful: '#8e44ad',
+        abortive: '#c0392b'
+    },
+    invalid: {
+        // Optional overrides; default invalid reason colors derive from flagColors
+    }
 };
 
 // Horizontal curvature levels (in pixels) by TCP flag type
@@ -269,6 +281,39 @@ fetch('color_mapping.json')
         };
     });
 
+// Load colors for flags from external JSON, merging into the existing object
+fetch('flag_colors.json')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+    .then(colors => {
+        Object.assign(flagColors, colors);
+        LOG('Loaded flag colors:', flagColors);
+    })
+    .catch(err => {
+        console.warn('Could not load flag_colors.json:', err);
+        // keep defaults in flagColors
+    });
+
+// Load colors for flows (closing + invalid) from external JSON, deep-merge
+fetch('flow_colors.json')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+    .then(colors => {
+        try {
+            if (colors && typeof colors === 'object') {
+                if (colors.closing && typeof colors.closing === 'object') {
+                    flowColors.closing = { ...flowColors.closing, ...colors.closing };
+                }
+                if (colors.invalid && typeof colors.invalid === 'object') {
+                    flowColors.invalid = { ...flowColors.invalid, ...colors.invalid };
+                }
+            }
+            LOG('Loaded flow colors:', flowColors);
+        } catch (e) { console.warn('Merging flow_colors.json failed:', e); }
+    })
+    .catch(err => {
+        console.warn('Could not load flow_colors.json:', err);
+        // keep defaults in flowColors
+    });
+
 function classifyFlags(flags) {
     if (flags === undefined || flags === null) return 'OTHER';
     const flagMap = { 0x01: 'FIN', 0x02: 'SYN', 0x04: 'RST', 0x08: 'PSH', 0x10: 'ACK' };
@@ -300,7 +345,8 @@ window.addEventListener('DOMContentLoaded', () => {
         hiddenInvalidReasons,
         hiddenCloseTypes,
         GLOBAL_BIN_COUNT,
-        flagColors
+        flagColors,
+        flowColors
     });
     initSidebar({
         onResetView: () => {
