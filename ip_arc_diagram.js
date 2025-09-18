@@ -85,7 +85,7 @@ let dotsSelection; // Cache the dots selection for performance
 let isHardResetInProgress = false; // Programmatic Reset View fast-path
 let timeExtent = [0, 0]; // Global time extent for the dataset
 // Global bin count used by both line graph and overview bar chart
-const GLOBAL_BIN_COUNT = 600;
+const GLOBAL_BIN_COUNT = 300;
 let pairs = new Map(); // Global pairs map for IP pairing system
 let ipPositions = new Map(); // Global IP positions map
 let ipOrder = []; // Current vertical order of IPs
@@ -1610,7 +1610,7 @@ function updateClosingStats(closings) {
     }
 }
 
-const createFlowList = (flows) => sbCreateFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal);
+const createFlowList = (flows) => sbCreateFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors);
 
 const updateTcpFlowStats = (flows) => sbUpdateTcpFlowStats(flows, selectedFlowIds, formatBytes);
 

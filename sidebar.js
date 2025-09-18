@@ -196,7 +196,7 @@ export function updateIPStats(packets, flagColors, formatBytes) {
     container.innerHTML = html;
 }
 
-export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal) {
+export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors = {}) {
     const container = document.getElementById('flowList');
     if (!container) return;
     if (!flows || flows.length === 0) {
@@ -204,19 +204,64 @@ export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimest
         return;
     }
     const sorted = [...flows].sort((a,b)=>a.startTime - b.startTime);
+
+    const closeColors = {
+        graceful: (flowColors.closing && flowColors.closing.graceful) || '#8e44ad',
+        abortive: (flowColors.closing && flowColors.closing.abortive) || '#c0392b'
+    };
+    const invalidLabels = {
+        'invalid_ack': 'Invalid ACK',
+        'rst_during_handshake': 'RST during handshake',
+        'incomplete_no_synack': 'Incomplete (no SYN+ACK)',
+        'incomplete_no_ack': 'Incomplete (no ACK)',
+        'invalid_synack': 'Invalid SYN+ACK',
+        'unknown_invalid': 'Invalid (unspecified)'
+    };
+    const getInvalidReason = (f) => {
+        if (!f) return null;
+        let r = f.invalidReason;
+        if (!r && (f.closeType === 'invalid' || f.state === 'invalid')) r = 'unknown_invalid';
+        return r || null;
+    };
+    const getFlowColor = (f) => {
+        const reason = getInvalidReason(f);
+        if (reason) {
+            return (flowColors.invalid && flowColors.invalid[reason]) || '#6c757d';
+        }
+        if (f && (f.closeType === 'graceful' || f.closeType === 'abortive')) {
+            return closeColors[f.closeType] || '#6c757d';
+        }
+        return '#adb5bd'; // neutral grey for unknown/ongoing
+    };
     let html = '';
     sorted.forEach(flow => {
         const duration = Math.round((flow.endTime - flow.startTime) / 1000000);
         const { utcTime: startTime } = formatTimestamp(flow.startTime);
         const { utcTime: endTime } = formatTimestamp(flow.endTime);
+        const reason = getInvalidReason(flow);
+        const color = getFlowColor(flow);
         let closeTypeText = '';
-        if (flow.closeType === 'graceful') closeTypeText = '• Graceful close';
-        else if (flow.closeType === 'abortive') closeTypeText = '• Abortive close';
-        else if (flow.closeType === 'invalid') closeTypeText = '<span style="color:#e74c3c; font-weight:600;">• Invalid</span>';
-        else if (flow.establishmentComplete) closeTypeText = '• Still open';
-        else closeTypeText = '• Incomplete';
+        if (reason) {
+            const label = invalidLabels[reason] || 'Invalid';
+            closeTypeText = `
+                <span style="display:inline-flex; align-items:center; gap:6px;">
+                    <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);"></span>
+                    <span style="color:#333;">${label}</span>
+                </span>`;
+        } else if (flow.closeType === 'graceful' || flow.closeType === 'abortive') {
+            const label = flow.closeType === 'graceful' ? 'Graceful close' : 'Abortive close';
+            closeTypeText = `
+                <span style="display:inline-flex; align-items:center; gap:6px;">
+                    <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);"></span>
+                    <span style="color:#333;">${label}</span>
+                </span>`;
+        } else if (flow.establishmentComplete) {
+            closeTypeText = '• Still open';
+        } else {
+            closeTypeText = '• Incomplete';
+        }
         html += `
-          <div class="flow-item" data-flow-id="${flow.id}">
+          <div class="flow-item" data-flow-id="${flow.id}" style="border-left: 4px solid ${color};">
             <input type="checkbox" class="flow-checkbox" id="flow-${flow.id}" ${selectedFlowIds.has(String(flow.id)) ? 'checked' : ''}>
             <div class="flow-info">
               <div class="flow-connection">${flow.initiator}:${flow.initiatorPort} ↔ ${flow.responder}:${flow.responderPort}</div>
