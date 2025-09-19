@@ -674,7 +674,8 @@ function updateTcpFlowPacketsGlobal() {
     // If no flows selected, ensure all dots are visible in both layers
     if (!showTcpFlows || selectedFlowIds.size === 0) {
         if (fullDomainLayer) fullDomainLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.5);
-        if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.8);
+        // Clear any stale selection-only dots to prevent size scale misreads
+        if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').remove();
         // Restore full-domain layer by default when no selection
         if (fullDomainLayer) fullDomainLayer.style('display', null);
         if (dynamicLayer) dynamicLayer.style('display', 'none');
@@ -1330,8 +1331,17 @@ async function updateIPFilter() {
 // Recompute global max bin count from visible dots, then reapply radii consistently
 function recomputeGlobalMaxBinCountFromVisibleDots() {
     if (!mainGroup) return;
-    let maxCount = 1;
-    mainGroup.selectAll('.direction-dot').each(function(d) {
+    // Prefer the layer that is currently shown; avoids counting hidden groups
+    let activeLayer = null;
+    try {
+        const dynDisplayed = dynamicLayer && dynamicLayer.style('display') !== 'none';
+        activeLayer = dynDisplayed ? dynamicLayer : fullDomainLayer || mainGroup;
+    } catch (_) {
+        activeLayer = fullDomainLayer || mainGroup;
+    }
+    if (!activeLayer) return;
+    let maxCount = 0;
+    activeLayer.selectAll('.direction-dot').each(function(d) {
         if (!d) return;
         const sel = d3.select(this);
         const display = sel.style('display');
@@ -1341,6 +1351,8 @@ function recomputeGlobalMaxBinCountFromVisibleDots() {
             if (d.count > maxCount) maxCount = d.count;
         }
     });
+    // If we found no eligible bins, keep the previous scaling to avoid jumps
+    if (maxCount <= 0) return;
     globalMaxBinCount = Math.max(1, maxCount);
     const scale = d3.scaleSqrt().domain([1, globalMaxBinCount]).range([RADIUS_MIN, RADIUS_MAX]);
     mainGroup.selectAll('.direction-dot')
