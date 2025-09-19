@@ -1221,6 +1221,9 @@ function drawGroundTruthBoxes(selectedIPs) {
         .text(d => d.event.eventType.length > 20 ? 
             d.event.eventType.substring(0, 17) + '...' : 
             d.event.eventType);
+
+    // Keep ground-truth boxes and labels above packet circles and arcs
+    try { groundTruthGroup.raise(); } catch (_) {}
 }
 
 // IP selection event listeners
