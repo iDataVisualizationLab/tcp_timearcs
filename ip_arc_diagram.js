@@ -1,6 +1,7 @@
 // Extracted from ip_arc_diagram_3.html inline script
 // This file contains all logic for the IP Connection Analysis visualization
-import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
+import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
+import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend } from './legends.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
 import { GLOBAL_BIN_COUNT } from './config.js';
 
@@ -114,7 +115,7 @@ let fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false 
 // - RADIUS_MAX: circle size for the largest bin observed at full zoom-out
 // - globalMaxBinCount: computed from the initial full-domain binning; reused at all zoom levels
 const RADIUS_MIN = 3;
-const RADIUS_MAX = 40;
+const RADIUS_MAX = 30;
 let globalMaxBinCount = 1;
 
 // User toggle: binning on/off
@@ -195,6 +196,129 @@ function drawSizeLegend() {
                 .style('font-size', '12px')
                 .style('fill', '#333')
                 .text(v);
+        });
+    } catch (_) { /* ignore legend draw errors */ }
+}
+
+// Compact flags legend placed next to the size legend (bottom-right)
+function drawFlagLegend() {
+    try {
+        if (!svg || !width || !height) return;
+        svg.select('.flag-legend').remove();
+
+        // Recompute size-legend box to align horizontally
+        const maxCount = Math.max(1, globalMaxBinCount);
+        const rScale = d3.scaleSqrt().domain([1, maxCount]).range([RADIUS_MIN, RADIUS_MAX]);
+        const maxR = Math.max(rScale(maxCount), RADIUS_MIN);
+        const padding = 8;
+        const labelGap = 32;
+        const sizeLegendWidth = maxR * 2 + padding * 2;
+        const sizeLegendHeight = 2 * maxR + padding + (padding + labelGap);
+        const sizeLegendX = Math.max(0, width - sizeLegendWidth - 12);
+        const sizeLegendY = Math.max(0, height - sizeLegendHeight - 12);
+
+        // Build items from flagColors keys; order to follow typical TCP flow
+        // Handshake -> Data -> Closing -> Resets; keep OTHER last
+        const allKeys = Object.keys(flagColors || {});
+        const preferredOrder = ['SYN', 'SYN+ACK', 'ACK', 'PSH+ACK', 'FIN', 'FIN+ACK', 'ACK+RST', 'RST'];
+        let items;
+        if (allKeys.length) {
+            const std = preferredOrder.filter(k => allKeys.includes(k));
+            const extras = allKeys.filter(k => !preferredOrder.includes(k) && k !== 'OTHER').sort((a,b)=>a.localeCompare(b));
+            items = [...std, ...extras];
+            if (allKeys.includes('OTHER')) items.push('OTHER');
+        } else {
+            items = ['SYN','SYN+ACK','ACK','PSH+ACK','FIN','FIN+ACK','ACK+RST','RST','OTHER'];
+        }
+
+        const sw = 10;       // swatch size
+        const rowH = 16;     // row height for readability
+        const innerPad = 6;
+        const colGap = 16;   // space between columns
+        const textLeft = 14; // text x offset from swatch
+        const titleH = 14;   // title line height
+        const maxRowsPerCol = 6;
+
+        // Split items into columns with up to maxRowsPerCol rows each
+        const cols = Math.max(1, Math.ceil(items.length / maxRowsPerCol));
+        const columns = Array.from({ length: cols }, (_, ci) => items.slice(ci * maxRowsPerCol, (ci + 1) * maxRowsPerCol));
+
+        // Measure text widths using a temporary DOM element
+        const measure = (txt) => {
+            try {
+                const el = document.createElement('span');
+                el.textContent = txt;
+                el.style.position = 'absolute';
+                el.style.visibility = 'hidden';
+                el.style.whiteSpace = 'nowrap';
+                el.style.font = '10px sans-serif';
+                document.body.appendChild(el);
+                const w = el.getBoundingClientRect().width;
+                document.body.removeChild(el);
+                return Math.ceil(w);
+            } catch (_) { return txt.length * 6; }
+        };
+        const colTextWidths = columns.map(col => (col.length ? Math.max(...col.map(measure)) : 0));
+        const colWidths = colTextWidths.map(w => sw + textLeft + w);
+        const rows = Math.max(...columns.map(c => c.length), 0);
+
+        const fWidth = innerPad * 2 + (colWidths.length ? colWidths.reduce((a,b)=>a+b,0) : 0) + colGap * Math.max(0, cols - 1);
+        const fHeight = innerPad * 2 + titleH + rows * rowH;
+
+        const legendX = Math.max(0, sizeLegendX - 12 - fWidth);
+        const legendY = Math.max(0, height - fHeight - 12);
+
+        const g = svg.append('g').attr('class', 'flag-legend').attr('transform', `translate(${legendX},${legendY})`);
+
+        // Background
+        g.append('rect')
+            .attr('x', 0)
+            .attr('y', 0)
+            .attr('rx', 6)
+            .attr('ry', 6)
+            .attr('width', fWidth)
+            .attr('height', fHeight)
+            .style('fill', '#fff')
+            .style('opacity', 0.85)
+            .style('stroke', '#ccc');
+
+        // Title
+        g.append('text')
+            .attr('x', fWidth / 2)
+            .attr('y', 12)
+            .attr('text-anchor', 'middle')
+            .style('font-size', '11px')
+            .style('font-weight', '600')
+            .style('fill', '#333')
+            .text('Flags');
+
+        const innerTop = titleH + innerPad;
+        // Render columns left to right
+        let xOffset = innerPad;
+        columns.forEach((col, ci) => {
+            const colW = colWidths[ci] || (sw + textLeft + 24);
+            col.forEach((flag, ri) => {
+                const y = innerTop + ri * rowH;
+                const color = flagColors[flag] || flagColors.OTHER || '#bdc3c7';
+                const x = xOffset;
+                g.append('rect')
+                    .attr('x', x)
+                    .attr('y', y - sw + 6)
+                    .attr('width', sw)
+                    .attr('height', sw)
+                    .attr('rx', 2)
+                    .attr('ry', 2)
+                    .style('fill', color)
+                    .style('stroke', '#fff')
+                    .style('shape-rendering', 'crispEdges');
+                g.append('text')
+                    .attr('x', x + textLeft)
+                    .attr('y', y + 4)
+                    .style('font-size', '10px')
+                    .style('fill', '#333')
+                    .text(flag);
+            });
+            xOffset += colW + colGap;
         });
     } catch (_) { /* ignore legend draw errors */ }
 }
@@ -291,6 +415,7 @@ fetch('flag_colors.json')
     .then(colors => {
         Object.assign(flagColors, colors);
         LOG('Loaded flag colors:', flagColors);
+        try { drawFlagLegend(); } catch (_) {}
     })
     .catch(err => {
         console.warn('Could not load flag_colors.json:', err);
@@ -332,6 +457,34 @@ function classifyFlags(flags) {
     if (flagStr === 'ACK+FIN') return 'FIN+ACK';
     if (flagStr === 'ACK+PSH') return 'PSH+ACK';
     return flagStr;
+}
+
+// Map flag type to a high-level TCP phase
+function flagPhase(flagType) {
+    switch (flagType) {
+        case 'SYN':
+        case 'SYN+ACK':
+        case 'ACK':
+            return 'establishment';
+        case 'PSH+ACK':
+        case 'OTHER':
+            return 'data';
+        case 'FIN':
+        case 'FIN+ACK':
+        case 'RST':
+        case 'ACK+RST':
+            return 'closing';
+        default:
+            return 'data';
+    }
+}
+
+function isFlagVisibleByPhase(flagType) {
+    const phase = flagPhase(flagType);
+    if (phase === 'establishment') return !!showEstablishment;
+    if (phase === 'data') return !!showDataTransfer;
+    if (phase === 'closing') return !!showClosing;
+    return true;
 }
 
 document.getElementById('dataFile').addEventListener('change', handleFileLoad);
@@ -388,10 +541,10 @@ window.addEventListener('DOMContentLoaded', () => {
                 }
             });
         },
-        onToggleShowTcpFlows: (checked) => { showTcpFlows = checked; updateTcpFlowPacketsGlobal(); drawSelectedFlowArcs(); },
-        onToggleEstablishment: (checked) => { showEstablishment = checked; drawSelectedFlowArcs(); },
-        onToggleDataTransfer: (checked) => { showDataTransfer = checked; drawSelectedFlowArcs(); },
-        onToggleClosing: (checked) => { showClosing = checked; drawSelectedFlowArcs(); },
+        onToggleShowTcpFlows: (checked) => { showTcpFlows = checked; updateTcpFlowPacketsGlobal(); drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
+        onToggleEstablishment: (checked) => { showEstablishment = checked; drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
+        onToggleDataTransfer: (checked) => { showDataTransfer = checked; drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
+        onToggleClosing: (checked) => { showClosing = checked; drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
         onToggleGroundTruth: (checked) => { showGroundTruth = checked; const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value); drawGroundTruthBoxes(selectedIPs); },
         onToggleBinning: (checked) => { useBinning = checked; isHardResetInProgress = true; applyZoomDomain(xScale.domain(), 'program'); setTimeout(()=>{ try { const selIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value); drawGroundTruthBoxes(selIPs); } catch(_){} }, 0); }
     });
@@ -607,6 +760,23 @@ function applyInvalidReasonFilter() {
                 } else if (d) {
                     const key = makeConnectionKey(d.src_ip, d.src_port || 0, d.dst_ip, d.dst_port || 0);
                     hide = keyIsHidden(key);
+                }
+            }
+            // Apply phase-based visibility regardless of legend toggles
+            if (!hide) {
+                if (d && Array.isArray(d.originalPackets) && d.originalPackets.length) {
+                    let anyVisibleByPhase = false;
+                    const arr = d.originalPackets;
+                    const len = Math.min(arr.length, 50);
+                    for (let i = 0; i < len; i++) {
+                        const p = arr[i];
+                        const ftype = classifyFlags(p.flags);
+                        if (isFlagVisibleByPhase(ftype)) { anyVisibleByPhase = true; break; }
+                    }
+                    hide = !anyVisibleByPhase;
+                } else if (d) {
+                    const ftype = d.binned ? d.flagType : classifyFlags(d.flags);
+                    hide = !isFlagVisibleByPhase(ftype);
                 }
             }
             d3.select(this)
@@ -835,12 +1005,14 @@ function drawSelectedFlowArcs() {
         const key = makeConnectionKey(p.src_ip, p.src_port, p.dst_ip, p.dst_port);
         if (!selectedKeys.has(key)) return;
 
+        const ftype = classifyFlags(p.flags);
+        if (!isFlagVisibleByPhase(ftype)) return;
         const path = arcPathGenerator(p);
         if (path && p.src_ip !== p.dst_ip) {
             const arc = mainGroup.append("path")
                 .attr("class", "flow-arc")
                 .attr("d", path)
-                .style("stroke", flagColors[classifyFlags(p.flags)] || flagColors.OTHER)
+                .style("stroke", flagColors[ftype] || flagColors.OTHER)
                 .style("opacity", 0.5)
                 .datum(p); // attach packet data for event handlers
 
@@ -1140,8 +1312,8 @@ async function updateIPFilter() {
         
         // Recreate visualization with filtered data
         visualizeTimeArcs(filteredData);
-        // Update flag statistics for the current filtered data
-        updateFlagStats(filteredData);
+        // Sidebar flag stats suppressed; render flags legend in-canvas
+        try { drawFlagLegend(); } catch (_) {}
         // Update IP statistics for the current filtered data
         updateIPStats(filteredData);
         // Recompute size scaling once DOM updates complete
@@ -1176,6 +1348,8 @@ function recomputeGlobalMaxBinCountFromVisibleDots() {
         .attr('data-orig-r', d => (d && d.binned && d.count > 1) ? scale(d.count) : RADIUS_MIN);
     // Keep the size legend in sync with the current scale
     try { drawSizeLegend(); } catch (_) {}
+    try { drawFlagLegend(); } catch (_) {}
+    try { drawFlagLegend(); } catch (_) {}
 }
         
 // Delegated to sidebar.js
@@ -2656,7 +2830,8 @@ function visualizeTimeArcs(packets) {
         .map(cb => cb.value);
     drawGroundTruthBoxes(selectedIPs);
     drawSelectedFlowArcs();
-    updateFlagStats(packets);
+    // Sidebar flag stats suppressed; show compact legend in-canvas
+    try { drawFlagLegend(); } catch (_) {}
 }
 
 function makeConnectionKey(src_ip, src_port, dst_ip, dst_port) {

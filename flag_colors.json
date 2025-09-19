@@ -1,11 +1,12 @@
 {
-  "SYN": "#1b9e77",
-  "SYN+ACK": "#e7298a",
+  "SYN": "#e7298a",
+  "SYN+ACK": "#1b9e77",
   "ACK": "#66a61e",
-  "FIN": "#7570b3",
-  "FIN+ACK": "#a6761d",
-  "RST": "#d95f02",
+  "FIN": "#4b2b7f",
+  "FIN+ACK": "#9891e8",
+  "RST": "#8B0000",
+  "PSH": "#8d6601",
   "PSH+ACK": "#ebab02",
-  "ACK+RST": "#1b9e77",
+  "ACK+RST": "#e57373",
   "OTHER": "#666666"
 }
