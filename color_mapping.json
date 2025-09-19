@@ -1,0 +1,25 @@
+{ 
+  "normal": "#4B4B4B",  
+  "client compromise": "#D41159",  
+  "malware ddos": "#2A9D4F",  
+  "scan /usr/bin/nmap": "#C9A200",  
+  "ddos": "#264D99",  
+  "failed attack framework-2.6/msfcli iis_nsiislog_po": "#CC6C1D",  
+  "no precursor client compromise exfil/sams_launch_v": "#6A0DAD",  
+  "c2 + tcp control channel exfil - no precursor nc": "#178DBD",  
+  "c2 + control channel exfil - no precursor nc": "#B030B0",  
+  "phishing email exploit/malware/trawler": "#79C000",  
+  "post-phishing c2 exploit/malware/malclient.pl": "#D98CA8",  
+  "post-phishing c2 + tcp control channel exfil explo": "#2E7C71",  
+  "failed attack framework-2.6/msfcli cabrightstor_di": "#A884E5",  
+  "post-phishing c2 heartbeat exploit/malware/malclie": "#6B4F1D",  
+  "spambot client compromise": "#F5E663",  
+  "spambot malicious download": "#660000",  
+  "spam bot": "#1A7F7F",  
+  "post-phishing client compromise + malicious download": "#E6A96B",  
+  "post-phishing c2 + tcp control channel exfil nc": "#007ACC",  
+  "break-DNS_1_exploit echo": "#666600",  
+  "c2 remote command execution nc": "#D97700",  
+  "c2+ tcp control channel exfil nc": "#008B8B"
+}
+
