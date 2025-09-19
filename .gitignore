@@ -1,0 +1,7 @@
+# Ignore CSV data files
+*.csv
+
+# Ignore hidden files (dotfiles) but keep this file
+.*
+!.gitignore
+

@@ -1,11 +1,11 @@
 {
-  "SYN": "#e74c3c",
-  "SYN+ACK": "#f39c12",
-  "ACK": "#27ae60",
-  "FIN": "#8e44ad",
-  "FIN+ACK": "#9b59b6",
-  "RST": "#34495e",
-  "PSH+ACK": "#3498db",
-  "ACK+RST": "#c0392b",
-  "OTHER": "#bdc3c7"
+  "SYN": "#1b9e77",
+  "SYN+ACK": "#e7298a",
+  "ACK": "#66a61e",
+  "FIN": "#7570b3",
+  "FIN+ACK": "#a6761d",
+  "RST": "#d95f02",
+  "PSH+ACK": "#ebab02",
+  "ACK+RST": "#1b9e77",
+  "OTHER": "#666666"
 }

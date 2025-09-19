@@ -2,6 +2,7 @@
 // This file contains all logic for the IP Connection Analysis visualization
 import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
+import { GLOBAL_BIN_COUNT } from './config.js';
 
 // Global debug flag to silence heavy logs in production
 const DEBUG = false;
@@ -84,8 +85,7 @@ let dotsSelection; // Cache the dots selection for performance
 // Overview timeline variables moved to overview_chart.js
 let isHardResetInProgress = false; // Programmatic Reset View fast-path
 let timeExtent = [0, 0]; // Global time extent for the dataset
-// Global bin count used by both line graph and overview bar chart
-const GLOBAL_BIN_COUNT = 300;
+// Global bin count is sourced from shared config.js
 let pairs = new Map(); // Global pairs map for IP pairing system
 let ipPositions = new Map(); // Global IP positions map
 let ipOrder = []; // Current vertical order of IPs
@@ -239,6 +239,10 @@ let flowColors = {
         graceful: '#8e44ad',
         abortive: '#c0392b'
     },
+    ongoing: {
+        open: '#6c757d',
+        incomplete: '#adb5bd'
+    },
     invalid: {
         // Optional overrides; default invalid reason colors derive from flagColors
     }
@@ -304,6 +308,9 @@ fetch('flow_colors.json')
                 }
                 if (colors.invalid && typeof colors.invalid === 'object') {
                     flowColors.invalid = { ...flowColors.invalid, ...colors.invalid };
+                }
+                if (colors.ongoing && typeof colors.ongoing === 'object') {
+                    flowColors.ongoing = { ...flowColors.ongoing, ...colors.ongoing };
                 }
             }
             LOG('Loaded flow colors:', flowColors);
@@ -514,7 +521,7 @@ function updateTcpFlowPacketsGlobal() {
     // If no flows selected, ensure all dots are visible in both layers
     if (!showTcpFlows || selectedFlowIds.size === 0) {
         if (fullDomainLayer) fullDomainLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.5);
-        if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.5);
+        if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.8);
         // Restore full-domain layer by default when no selection
         if (fullDomainLayer) fullDomainLayer.style('display', null);
         if (dynamicLayer) dynamicLayer.style('display', 'none');
@@ -553,15 +560,15 @@ function applyInvalidReasonFilter() {
             let r = f.invalidReason;
             if (!r && (f.closeType === 'invalid' || f.state === 'invalid')) r = 'unknown_invalid';
             reasonByKey.set(key, r || null);
-            // Closing-type visibility: exclude invalid flows from 'unknown'
-            // Only map to 'unknown' if NOT invalid and not graceful/abortive
+            // Closing-type visibility: exclude invalid flows from ongoing group
+            // Map non-invalid, non-closed flows to 'open' (established) or 'incomplete'
             const isInvalid = !!r || f.closeType === 'invalid' || f.state === 'invalid';
             let ct = null;
             if (!isInvalid) {
                 if (f.closeType === 'graceful' || f.closeType === 'abortive') {
                     ct = f.closeType;
                 } else {
-                    ct = 'unknown';
+                    ct = (f.establishmentComplete === true || f.state === 'established' || f.state === 'data_transfer') ? 'open' : 'incomplete';
                 }
             }
             closeTypeByKey.set(key, ct);
@@ -635,10 +642,18 @@ function applyInvalidReasonFilter() {
         });
     }
 
-    // Update closing legend styles and hide specific closing lines
+    // Update closing and ongoing legend styles and hide specific closing lines
     const cpanel = document.getElementById('closingLegendPanel');
     if (cpanel) {
         cpanel.querySelectorAll('.closing-legend-item').forEach((el) => {
+            const t = el.getAttribute('data-type');
+            const disabled = !!(t && hiddenCloseTypes && hiddenCloseTypes.has(t));
+            el.style.opacity = disabled ? '0.45' : '1';
+        });
+    }
+    const opanel = document.getElementById('ongoingLegendPanel');
+    if (opanel) {
+        opanel.querySelectorAll('.closing-legend-item').forEach((el) => {
             const t = el.getAttribute('data-type');
             const disabled = !!(t && hiddenCloseTypes && hiddenCloseTypes.has(t));
             el.style.opacity = disabled ? '0.45' : '1';

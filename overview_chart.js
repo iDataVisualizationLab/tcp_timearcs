@@ -1,4 +1,5 @@
 // Overview chart module: manages stacked invalid flows overview, brush, and legends
+import { GLOBAL_BIN_COUNT } from './config.js';
 // Internal state
 let overviewSvg, overviewXScale, overviewBrush, overviewWidth = 0, overviewHeight = 100;
 let isUpdatingFromBrush = false; // prevent circular updates
@@ -20,8 +21,7 @@ let hiddenInvalidReasonsRef = null;
 let hiddenCloseTypesRef = null;
 let applyInvalidReasonFilterRef = null; // callback from main to hide/show dots/arcs
 
-// Config shared with main
-let GLOBAL_BIN_COUNT = 600;
+// Config shared with main (imported)
 let flagColors = {};
 let flowColors = {};
 
@@ -40,7 +40,7 @@ export function initOverview(options) {
     hiddenInvalidReasonsRef = options.hiddenInvalidReasons;
     hiddenCloseTypesRef = options.hiddenCloseTypes;
     applyInvalidReasonFilterRef = options.applyInvalidReasonFilter;
-    GLOBAL_BIN_COUNT = options.GLOBAL_BIN_COUNT ?? GLOBAL_BIN_COUNT;
+    // Bin count is centralized in config.js; ignore per-call overrides
     flagColors = options.flagColors || {};
     flowColors = options.flowColors || {};
 }
@@ -76,6 +76,16 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     // Separate closing types for the top histogram
     const closingTypes = ['graceful', 'abortive'];
     const closingFlows = allFlows.filter(f => f && closingTypes.includes(f.closeType));
+    // Separate ongoing types (middle histogram band)
+    const isInvalid = (f) => f && (f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason);
+    const isClosedGraceful = (f) => f && f.closeType === 'graceful';
+    const isClosedAbortive = (f) => f && f.closeType === 'abortive';
+    const isClosed = (f) => isClosedGraceful(f) || isClosedAbortive(f);
+    const isOngoingCandidate = (f) => f && !isInvalid(f) && !isClosed(f);
+    const isOpen = (f) => isOngoingCandidate(f) && (f.establishmentComplete === true || f.state === 'established' || f.state === 'data_transfer');
+    const isIncomplete = (f) => isOngoingCandidate(f) && !isOpen(f);
+    const ongoingTypes = ['open', 'incomplete'];
+    const ongoingClassifier = (f) => isOpen(f) ? 'open' : (isIncomplete(f) ? 'incomplete' : null);
 
     const invalidLabels = {
         'invalid_ack': 'Invalid ACK',
@@ -167,6 +177,23 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         arr.push(f);
         m.set(t, arr);
     }
+    // Build bins for ongoing types (middle histogram)
+    const binOngoingMap = new Map();
+    for (const f of allFlows) {
+        if (!f || typeof f.startTime !== 'number') continue;
+        if (isInvalid(f) || isClosed(f)) continue;
+        const t = ongoingClassifier(f);
+        if (!t) continue;
+        const idx = Math.min(
+            binCount - 1,
+            Math.max(0, Math.floor((f.startTime - timeExtent[0]) / timeBinSize))
+        );
+        let m = binOngoingMap.get(idx);
+        if (!m) { m = new Map(); binOngoingMap.set(idx, m); }
+        const arr = m.get(t) || [];
+        arr.push(f);
+        m.set(t, arr);
+    }
 
     // Compute per-bin totals and global max per direction
     let maxBinTotalInvalid = 0;
@@ -190,9 +217,25 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         if (total > maxBinTotalClosing) maxBinTotalClosing = total;
     }
     maxBinTotalClosing = Math.max(1, maxBinTotalClosing);
+    let maxBinTotalOngoing = 0;
+    const binTotalsOngoing = new Map();
+    for (let i = 0; i < binCount; i++) {
+        const m = binOngoingMap.get(i);
+        let total = 0;
+        if (m) for (const arr of m.values()) total += arr.length;
+        binTotalsOngoing.set(i, total);
+        if (total > maxBinTotalOngoing) maxBinTotalOngoing = total;
+    }
+    maxBinTotalOngoing = Math.max(1, maxBinTotalOngoing);
+    // Shared max values to keep all categories proportional
+    const sharedUpMax = Math.max(1, maxBinTotalClosing, maxBinTotalOngoing);
+    const sharedAllMax = Math.max(sharedUpMax, maxBinTotalInvalid);
 
     // Layout heights
     const chartHeightUp = Math.max(10, axisY - 6);
+    // Split the upward area into two bands: closing (top) and ongoing (middle)
+    const chartHeightUpOngoing = chartHeightUp * 0.45; // lower band (closest to axis)
+    const chartHeightUpClosing = chartHeightUp - chartHeightUpOngoing; // remaining top band
     const brushTopY = overviewHeight - 4; // top of brush selection area
     const chartHeightDown = Math.max(6, brushTopY - axisY - 4); // keep a tiny gap from brush
 
@@ -200,6 +243,10 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     const closeColors = {
         graceful: (flowColors.closing && flowColors.closing.graceful) || '#8e44ad',
         abortive: (flowColors.closing && flowColors.closing.abortive) || '#c0392b'
+    };
+    const ongoingColors = {
+        open: (flowColors.ongoing && flowColors.ongoing.open) || '#6c757d',
+        incomplete: (flowColors.ongoing && flowColors.ongoing.incomplete) || '#adb5bd'
     };
 
     // Prepare render data for both directions
@@ -212,8 +259,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         const widthPx = Math.max(1, x1 - x0);
         const baseX = x0;
 
-        // Upward stacking: closing types
-        let yTop = axisY;
+        // Upward stacking: closing types (top band)
+        let yTop = axisY - chartHeightUpOngoing;
         const mTop = binCloseMap.get(i) || new Map();
         const totalTop = binTotalsClosing.get(i) || 0;
         if (totalTop > 0) {
@@ -221,13 +268,48 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mTop.get(t) || [];
                 const count = arr.length;
                 if (count === 0) continue;
-                const h = (count / maxBinTotalClosing) * chartHeightUp;
+                const h = (count / sharedUpMax) * chartHeightUpClosing;
                 yTop -= h;
                 segments.push({
                     kind: 'closing', closeType: t, reason: null,
                     x: baseX, y: yTop, width: widthPx, height: h,
                     count, flows: arr, binIndex: i
                 });
+            }
+        }
+
+        // Ongoing types (middle band) grow from band center
+        const mMid = binOngoingMap.get(i) || new Map();
+        const totalMid = binTotalsOngoing.get(i) || 0;
+        if (totalMid > 0) {
+            const centerY = axisY - (chartHeightUpOngoing / 2);
+            // open: grow upward from center
+            {
+                const arr = mMid.get('open') || [];
+                const count = arr.length;
+                if (count > 0) {
+                    const h = (count / sharedUpMax) * (chartHeightUpOngoing / 2);
+                    const y = centerY - h;
+                    segments.push({
+                        kind: 'ongoing', closeType: 'open', reason: null,
+                        x: baseX, y, width: widthPx, height: h,
+                        count, flows: arr, binIndex: i
+                    });
+                }
+            }
+            // incomplete: grow downward from center
+            {
+                const arr = mMid.get('incomplete') || [];
+                const count = arr.length;
+                if (count > 0) {
+                    const h = (count / sharedUpMax) * (chartHeightUpOngoing / 2);
+                    const y = centerY;
+                    segments.push({
+                        kind: 'ongoing', closeType: 'incomplete', reason: null,
+                        x: baseX, y, width: widthPx, height: h,
+                        count, flows: arr, binIndex: i
+                    });
+                }
             }
         }
 
@@ -240,7 +322,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mBot.get(reason) || [];
                 const count = arr.length;
                 if (count === 0) continue;
-                const h = (count / maxBinTotalInvalid) * chartHeightDown;
+                const h = (count / sharedAllMax) * chartHeightDown;
                 const y = yBottom; // start at baseline and grow downward
                 yBottom += h;
                 segments.push({
@@ -252,6 +334,55 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         }
     }
 
+    // Amplify/reset functions per band to avoid vertical jumps
+    const amplifyBinBand = (binIndex, bandKind) => {
+        const targetSy = 1.8;
+        const axisY = overviewHeight - 30;
+
+        const upTotalClose = (binTotalsClosing && binTotalsClosing.get) ? (binTotalsClosing.get(binIndex) || 0) : 0;
+        const upTotalOngoing = (binTotalsOngoing && binTotalsOngoing.get) ? (binTotalsOngoing.get(binIndex) || 0) : 0;
+        const downTotal = (binTotalsInvalid && binTotalsInvalid.get) ? (binTotalsInvalid.get(binIndex) || 0) : 0;
+        const upHeightClose = (upTotalClose / Math.max(1, sharedUpMax)) * chartHeightUpClosing;
+        const upHeightOngoing = (upTotalOngoing / Math.max(1, sharedUpMax)) * chartHeightUpOngoing;
+        const downHeight = (downTotal / Math.max(1, sharedAllMax)) * chartHeightDown;
+
+        // Per-band scale and pivot
+        const syClose = Math.max(1.0, upHeightClose > 0 ? Math.min(targetSy, chartHeightUpClosing / Math.max(1e-6, upHeightClose)) : 1.0);
+        const syOngoing = Math.max(1.0, upHeightOngoing > 0 ? Math.min(targetSy, chartHeightUpOngoing / Math.max(1e-6, upHeightOngoing)) : 1.0);
+        const syInvalid = Math.max(1.0, downHeight > 0 ? Math.min(targetSy, chartHeightDown / Math.max(1e-6, downHeight)) : 1.0);
+        const sxClose = 3.0;
+        const sxOngoing = 1.0; // no left-right growth for middle band
+        const sxInvalid = 3.0;
+        const pivotClose = axisY - chartHeightUpOngoing; // bottom of closing band
+        const pivotOngoing = axisY - (chartHeightUpOngoing / 2); // center of ongoing band
+        const pivotInvalid = axisY;                      // baseline
+
+        overviewSvg.selectAll('.overview-stack-segment')
+            .filter(s => s.binIndex === binIndex && (
+                bandKind ? s.kind === bandKind : true
+            ))
+            .transition().duration(140)
+            .attr('transform', s => {
+                const cx = s.x + s.width / 2;
+                const sy = (s.kind === 'closing') ? syClose : (s.kind === 'ongoing' ? syOngoing : syInvalid);
+                const sx = (s.kind === 'closing') ? sxClose : (s.kind === 'ongoing' ? sxOngoing : sxInvalid);
+                const py = (s.kind === 'closing') ? pivotClose : (s.kind === 'ongoing' ? pivotOngoing : pivotInvalid);
+                return `translate(${cx},${py}) scale(${sx},${sy}) translate(${-cx},${-py})`;
+            })
+            .attr('stroke', 'none')
+            .attr('stroke-width', 0);
+    };
+    const resetBinBand = (binIndex, bandKind) => {
+        overviewSvg.selectAll('.overview-stack-segment')
+            .filter(s => s.binIndex === binIndex && (
+                bandKind ? s.kind === bandKind : true
+            ))
+            .transition().duration(180)
+            .attr('transform', null)
+            .attr('stroke', '#ffffff')
+            .attr('stroke-width', 0.5);
+    };
+
     // Render combined segments
     overviewSvg.selectAll('.overview-stack-segment')
         .data(segments)
@@ -261,39 +392,14 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         .attr('y', d => d.y)
         .attr('width', d => d.width)
         .attr('height', d => Math.max(1, d.height))
-        .attr('fill', d => d.kind === 'invalid' ? (invalidFlowColors[d.reason] || '#6c757d') : (closeColors[d.closeType] || '#6c757d'))
+        .attr('fill', d => d.kind === 'invalid' ? (invalidFlowColors[d.reason] || '#6c757d') : (d.kind === 'closing' ? (closeColors[d.closeType] || '#6c757d') : (ongoingColors[d.closeType] || '#6c757d')))
         .attr('stroke', '#ffffff')
         .attr('stroke-width', 0.5)
         .attr('vector-effect', 'non-scaling-stroke')
-        .style('cursor', 'pointer')
-        .on('mouseover', (event, d) => {
-            const sx = 3.0; // horizontal magnification on hover
-            const targetSy = 1.8; // vertical magnification target on hover
-            const upTotal = (binTotalsClosing && binTotalsClosing.get) ? (binTotalsClosing.get(d.binIndex) || 0) : 0;
-            const downTotal = (binTotalsInvalid && binTotalsInvalid.get) ? (binTotalsInvalid.get(d.binIndex) || 0) : 0;
-            const upHeight = (upTotal / Math.max(1, maxBinTotalClosing)) * chartHeightUp;
-            const downHeight = (downTotal / Math.max(1, maxBinTotalInvalid)) * chartHeightDown;
-            let sy = targetSy;
-            if (upHeight > 0) sy = Math.min(sy, chartHeightUp / upHeight);
-            if (downHeight > 0) sy = Math.min(sy, chartHeightDown / downHeight);
-                sy = Math.max(1.0, sy);
-                overviewSvg.selectAll('.overview-stack-segment')
-                    .filter(s => s.binIndex === d.binIndex)
-                    .transition().duration(140)
-                    .attr('transform', s => {
-                        const cx = s.x + s.width / 2;
-                        const axisY = overviewHeight - 30;
-                        return `translate(${cx},${axisY}) scale(${sx},${sy}) translate(${-cx},${-axisY})`;
-                    })
-                    .attr('stroke-width', 1.8);
-        })
-        .on('mouseout', (event, d) => {
-            overviewSvg.selectAll('.overview-stack-segment')
-                .filter(s => s.binIndex === d.binIndex)
-                .transition().duration(180)
-                .attr('transform', null)
-                .attr('stroke-width', 0.5);
-        })
+        .style('cursor', 'default')
+        // Make hovering a segment amplify only its band
+        .on('mouseover', (event, d) => amplifyBinBand(d.binIndex, d.kind))
+        .on('mouseout', (event, d) => resetBinBand(d.binIndex, d.kind))
         .on('click', (event, d) => {
             const timeExtent = getTimeExtentRef();
             if (!timeExtent) return;
@@ -302,24 +408,55 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
             const timeBinSize = totalRange / binCount;
 
-            const binStartTime = timeExtent[0] + (d.binIndex * timeBinSize);
-            const binEndTime = binStartTime + timeBinSize;
-            const timePerPixel = totalRange / Math.max(1, width);
-            const minPaddingUs = 20000;
-            const paddingFromPixels = Math.ceil(1 * timePerPixel);
-            const padding = Math.max(minPaddingUs, paddingFromPixels);
+            // Gather ALL flows in this bin across bands
+            const idx = d.binIndex;
+            const flowsInBin = new Set();
+            const addFromMap = (m) => {
+                const mm = m.get(idx);
+                if (!mm) return;
+                for (const arr of mm.values()) {
+                    if (Array.isArray(arr)) arr.forEach(f => { if (f) flowsInBin.add(f); });
+                }
+            };
+            try { addFromMap(binReasonMap); } catch {}
+            try { addFromMap(binCloseMap); } catch {}
+            try { addFromMap(binOngoingMap); } catch {}
 
-            let a = Math.max(timeExtent[0], Math.floor(binStartTime - padding));
-            let b = Math.min(timeExtent[1], Math.ceil(binEndTime + padding));
+            let minTs = Infinity, maxTs = -Infinity;
+            flowsInBin.forEach(f => {
+                if (!f) return;
+                if (Number.isFinite(f.startTime)) minTs = Math.min(minTs, Math.floor(f.startTime));
+                if (Number.isFinite(f.endTime)) maxTs = Math.max(maxTs, Math.floor(f.endTime));
+            });
+
+            // Fallback to bin boundaries if no flows collected
+            if (!Number.isFinite(minTs) || !Number.isFinite(maxTs) || maxTs <= minTs) {
+                const binStartTime = timeExtent[0] + (d.binIndex * timeBinSize);
+                const binEndTime = binStartTime + timeBinSize;
+                minTs = Math.floor(binStartTime);
+                maxTs = Math.ceil(binEndTime);
+            }
+
+            // Tight padding similar to zoomToFlow()
+            const timePerPixel = totalRange / Math.max(1, width);
+            const minPaddingUs = 50000; // 0.05s
+            const paddingPixels = 2;
+            const paddingPercent = 0.005; // 0.5%
+            const paddingFromPixels = Math.ceil(paddingPixels * timePerPixel);
+            const duration = Math.max(1, maxTs - minTs);
+            const paddingFromPercent = Math.ceil(duration * paddingPercent);
+            const cappedPercentPadding = Math.min(paddingFromPercent, Math.ceil(duration * 0.25));
+            const padding = Math.max(minPaddingUs, Math.min(paddingFromPixels, cappedPercentPadding));
+            let a = Math.max(timeExtent[0], Math.floor(minTs - padding));
+            let b = Math.min(timeExtent[1], Math.ceil(maxTs + padding));
             if (b <= a) b = Math.min(timeExtent[1], a + 1);
+
             applyZoomDomainRef([a, b], 'flow');
             try { updateBrushFromZoom(); } catch {}
 
-            // Select only the flows belonging to the clicked segment (not the whole bin)
-            const segmentFlows = Array.isArray(d.flows) ? d.flows : [];
-            if (!segmentFlows.length) return;
+            // Select ALL flows in the bin so link arcs render when zoomed
             try {
-                const idsToSelect = new Set(segmentFlows.map(f => String(f.id)));
+                const idsToSelect = new Set(Array.from(flowsInBin).map(f => String(f.id)));
                 const selectedFlowIds = getSelectedFlowIdsRef();
                 selectedFlowIds.clear();
                 idsToSelect.forEach(id => selectedFlowIds.add(id));
@@ -339,7 +476,126 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             }
         })
         .append('title')
-        .text(d => `${d.count} ${d.kind === 'invalid' ? 'invalid' : d.closeType} flow(s)`);
+        .text(d => {
+            if (d.kind === 'invalid') return `${d.count} invalid flow(s)`;
+            if (d.kind === 'closing') return `${d.count} ${d.closeType} close(s)`;
+            return `${d.count} ${d.closeType} flow(s)`; // ongoing: open/incomplete
+        });
+
+    // Add generous transparent hit-areas per bin: full column width, full height.
+    // We still amplify per-band, but we choose band based on mouse Y within the column.
+    try {
+        const hitGroup = overviewSvg.append('g').attr('class', 'overview-hit-areas');
+        try { hitGroup.raise(); } catch {}
+        const lastBandByBin = new Map();
+        for (let i = 0; i < binCount; i++) {
+            const binStartTime = timeExtent[0] + i * timeBinSize;
+            const binEndTime = binStartTime + timeBinSize;
+            const x0 = overviewXScale(binStartTime);
+            const x1 = overviewXScale(binEndTime);
+            // Use exact bin span for hit area to align with bars
+            const widthPx = Math.max(1, x1 - x0);
+            const x = x0;
+            const axis = (overviewHeight - 30);
+
+            // One full-height column hit area per bin
+            const col = hitGroup.append('rect')
+                .attr('class', 'overview-bin-hit column')
+                .attr('x', x)
+                .attr('y', 0)
+                .attr('width', widthPx)
+                .attr('height', overviewHeight)
+                .style('fill', 'transparent')
+                .style('pointer-events', 'all')
+                .style('cursor', 'pointer')
+                .on('mousemove', (event) => {
+                    // Determine band by mouse Y within the column
+                    const p = d3.pointer(event, overviewSvg.node());
+                    const y = p ? p[1] : 0;
+                    let band = 'invalid';
+                    if (y < axis - chartHeightUpOngoing) band = 'closing';
+                    else if (y < axis) band = 'ongoing';
+                    const prev = lastBandByBin.get(i);
+                    if (prev !== band) {
+                        if (prev) resetBinBand(i, prev);
+                        amplifyBinBand(i, band);
+                        lastBandByBin.set(i, band);
+                    }
+                })
+                .on('mouseout', () => {
+                    const prev = lastBandByBin.get(i);
+                    if (prev) resetBinBand(i, prev);
+                    lastBandByBin.delete(i);
+                })
+                .on('click', () => {
+                    // Gather ALL flows in this bin and zoom to first/last arc across them
+                    const width = getWidthRef();
+                    const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
+                    const timeBinSize = totalRange / binCount;
+                    const flowsInBin = new Set();
+                    const addFromMap = (m) => {
+                        const mm = m.get(i);
+                        if (!mm) return;
+                        for (const arr of mm.values()) {
+                            if (Array.isArray(arr)) arr.forEach(f => { if (f) flowsInBin.add(f); });
+                        }
+                    };
+                    try { addFromMap(binReasonMap); } catch {}
+                    try { addFromMap(binCloseMap); } catch {}
+                    try { addFromMap(binOngoingMap); } catch {}
+
+                    let minTs = Infinity, maxTs = -Infinity;
+                    flowsInBin.forEach(f => {
+                        if (!f) return;
+                        if (Number.isFinite(f.startTime)) minTs = Math.min(minTs, Math.floor(f.startTime));
+                        if (Number.isFinite(f.endTime)) maxTs = Math.max(maxTs, Math.floor(f.endTime));
+                    });
+
+                    if (!Number.isFinite(minTs) || !Number.isFinite(maxTs) || maxTs <= minTs) {
+                        const binStartTime = timeExtent[0] + (i * timeBinSize);
+                        const binEndTime = binStartTime + timeBinSize;
+                        minTs = Math.floor(binStartTime);
+                        maxTs = Math.ceil(binEndTime);
+                    }
+
+                    const timePerPixel = totalRange / Math.max(1, width);
+                    const minPaddingUs = 50000; // 0.05s
+                    const paddingPixels = 2;
+                    const paddingPercent = 0.005;
+                    const paddingFromPixels = Math.ceil(paddingPixels * timePerPixel);
+                    const duration = Math.max(1, maxTs - minTs);
+                    const paddingFromPercent = Math.ceil(duration * paddingPercent);
+                    const cappedPercentPadding = Math.min(paddingFromPercent, Math.ceil(duration * 0.25));
+                    const padding = Math.max(minPaddingUs, Math.min(paddingFromPixels, cappedPercentPadding));
+                    let a = Math.max(timeExtent[0], Math.floor(minTs - padding));
+                    let b = Math.min(timeExtent[1], Math.ceil(maxTs + padding));
+                    if (b <= a) b = Math.min(timeExtent[1], a + 1);
+                    applyZoomDomainRef([a, b], 'overview');
+                    try { updateBrushFromZoom(); } catch {}
+
+                    // Select flows so link arcs are drawn
+                    try {
+                        const idsToSelect = new Set(Array.from(flowsInBin).map(f => String(f.id)));
+                        const selectedFlowIds = getSelectedFlowIdsRef();
+                        selectedFlowIds.clear();
+                        idsToSelect.forEach(id => selectedFlowIds.add(id));
+                        const list = document.getElementById('flowList');
+                        if (list) {
+                            list.querySelectorAll('.flow-item').forEach(item => {
+                                const fid = item.getAttribute('data-flow-id');
+                                const checked = idsToSelect.has(String(fid));
+                                const checkbox = item.querySelector('.flow-checkbox');
+                                if (checkbox) checkbox.checked = checked;
+                                if (checked) item.classList.add('selected'); else item.classList.remove('selected');
+                            });
+                        }
+                        updateTcpFlowPacketsGlobalRef();
+                    } catch (e) {
+                        console.warn('Failed to select flows from overview column click:', e);
+                    }
+                });
+        }
+    } catch {}
 
     // Legends
     try {
@@ -399,28 +655,37 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     } catch (e) {}
 
     try {
+        const flowsAll = Array.isArray(getCurrentFlowsRef()) ? getCurrentFlowsRef() : [];
+        const isInvalid = (f) => f && (f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason);
+        const isClosedGraceful = (f) => f && f.closeType === 'graceful';
+        const isClosedAbortive = (f) => f && f.closeType === 'abortive';
+        const isClosed = (f) => isClosedGraceful(f) || isClosedAbortive(f);
+        const isOngoingCandidate = (f) => f && !isInvalid(f) && !isClosed(f);
+        const isOpen = (f) => isOngoingCandidate(f) && (f.establishmentComplete === true || f.state === 'established' || f.state === 'data_transfer');
+        const isIncomplete = (f) => isOngoingCandidate(f) && !isOpen(f);
+
+        const graceful = flowsAll.filter(isClosedGraceful).length;
+        const abortive = flowsAll.filter(isClosedAbortive).length;
+        const openCount = flowsAll.filter(isOpen).length;
+        const incompleteCount = flowsAll.filter(isIncomplete).length;
+
+        // Closing legend (graceful/abortive only)
         const cpanel = document.getElementById('closingLegendPanel');
         if (cpanel) {
-            const flowsAll = Array.isArray(getCurrentFlowsRef()) ? getCurrentFlowsRef() : [];
-            const isInvalid = (f) => f && (f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason);
-            const graceful = flowsAll.filter(f => f && f.closeType === 'graceful').length;
-            const abortive = flowsAll.filter(f => f && f.closeType === 'abortive').length;
-            // Unknown = not invalid AND not graceful/abortive
-            const unknown = flowsAll.filter(f => f && !isInvalid(f) && (!f.closeType || (f.closeType !== 'graceful' && f.closeType !== 'abortive'))).length;
-            const entries = [
+            const closeEntries = [
                 { type: 'graceful', label: 'Graceful closes', color: ((flowColors.closing && flowColors.closing.graceful) || '#8e44ad'), count: graceful },
-                { type: 'abortive', label: 'Abortive (RST)', color: ((flowColors.closing && flowColors.closing.abortive) || '#c0392b'), count: abortive },
-                { type: 'unknown', label: 'Unknown', color: '#6c757d', count: unknown }
+                { type: 'abortive', label: 'Abortive (RST)', color: ((flowColors.closing && flowColors.closing.abortive) || '#c0392b'), count: abortive }
             ];
-            const total = graceful + abortive + unknown;
-            const itemsHtml = entries.map(e => `
+            const totalClosed = graceful + abortive;
+            const closeItemsHtml = closeEntries.map(e => `
                 <div class="closing-legend-item" data-type="${e.type}" style="display:flex; align-items:center; gap:8px; margin:4px 0; cursor:pointer;">
                     <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${e.color}; border:1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.1);"></span>
                     <span style="flex:1; color:#333;">${e.label}</span>
                     <span style="color:#555;">${e.count}</span>
                 </div>
             `).join('');
-            sbRenderClosingLegendRef(cpanel, itemsHtml || '<div style="color:#666;">No closing data</div>', `Closing types (flows: ${total})`);
+            sbRenderClosingLegendRef(cpanel, closeItemsHtml || '<div style="color:#666;">No closing data</div>', `Closing types (flows: ${totalClosed})`);
+            const tooltipSel = d3.select('#tooltip');
             cpanel.querySelectorAll('.closing-legend-item').forEach((el) => {
                 el.addEventListener('click', () => {
                     const t = el.getAttribute('data-type');
@@ -428,8 +693,59 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                     const setRef = hiddenCloseTypesRef;
                     if (setRef.has(t)) setRef.delete(t); else setRef.add(t);
                     try { updateOverviewInvalidVisibility(); } catch {}
-                    // Also apply to main arc graph without rebinning
                     try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+                });
+                el.addEventListener('mouseover', (event) => {
+                    const t = el.getAttribute('data-type');
+                    const label = t === 'graceful' ? 'Graceful closes' : (t === 'abortive' ? 'Abortive (RST)' : '');
+                    const tip = t === 'graceful' ? 'Connection closed via FIN/ACK sequence.' : 'Connection terminated by RST (abortive).';
+                    tooltipSel.style('display', 'block').html(`<b>${label}</b><br>${tip}`);
+                });
+                el.addEventListener('mousemove', (event) => {
+                    tooltipSel.style('left', `${event.pageX + 12}px`).style('top', `${event.pageY - 8}px`);
+                });
+                el.addEventListener('mouseout', () => {
+                    tooltipSel.style('display', 'none');
+                });
+            });
+        }
+
+        // Ongoing legend (separate: Open vs Incomplete)
+        const opanel = document.getElementById('ongoingLegendPanel');
+        if (opanel) {
+            const ongoingEntries = [
+                { type: 'open', label: 'Open (established)', color: (flowColors.ongoing && flowColors.ongoing.open) || '#6c757d', count: openCount, tip: 'Handshake completed, no closing observed in range.' }
+            ];
+            const oHtml = ongoingEntries.map(e => `
+                <div class="closing-legend-item" data-type="${e.type}" style="display:flex; align-items:center; gap:8px; margin:4px 0; cursor:pointer;">
+                    <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${e.color}; border:1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.1);"></span>
+                    <span style="flex:1; color:#333;">${e.label}</span>
+                    <span style="color:#555;">${e.count}</span>
+                </div>`).join('');
+            const totalOngoing = openCount;
+            sbRenderClosingLegendRef(opanel, oHtml || '<div style="color:#666;">No ongoing flows</div>', `Ongoing flows (open): ${totalOngoing}`);
+
+            const tooltipSel = d3.select('#tooltip');
+            opanel.querySelectorAll('.closing-legend-item').forEach((el) => {
+                el.addEventListener('click', () => {
+                    const t = el.getAttribute('data-type');
+                    if (!t) return;
+                    const setRef = hiddenCloseTypesRef;
+                    if (setRef.has(t)) setRef.delete(t); else setRef.add(t);
+                    try { updateOverviewInvalidVisibility(); } catch {}
+                    try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+                });
+                el.addEventListener('mouseover', (event) => {
+                    const t = el.getAttribute('data-type');
+                    const entry = ongoingEntries.find(e => e.type === t);
+                    if (!entry) return;
+                    tooltipSel.style('display', 'block').html(`<b>${entry.label}</b><br>${entry.tip}`);
+                });
+                el.addEventListener('mousemove', (event) => {
+                    tooltipSel.style('left', `${event.pageX + 12}px`).style('top', `${event.pageY - 8}px`);
+                });
+                el.addEventListener('mouseout', () => {
+                    tooltipSel.style('display', 'none');
                 });
             });
         }
@@ -442,9 +758,11 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             return date.toISOString().split('T')[1].substring(0, 5);
         });
 
+    // Place the time axis below the bar area to avoid overlap with invalid bars
+    const timeAxisY = overviewHeight - 8; // a few px above the bottom/brush
     overviewSvg.append('g')
         .attr('class', 'overview-axis')
-        .attr('transform', `translate(0,${overviewHeight - 30})`)
+        .attr('transform', `translate(0,${timeAxisY})`)
         .call(overviewXAxis);
 
     const bandTop = overviewHeight - 4;
@@ -574,7 +892,7 @@ export function updateOverviewInvalidVisibility() {
             if (d.kind === 'invalid') {
                 return (noReasonHidden || !d.reason || !hiddenReasons.has(d.reason)) ? null : 'none';
             }
-            if (d.kind === 'closing') {
+            if (d.kind === 'closing' || d.kind === 'ongoing') {
                 return (noCloseHidden || !d.closeType || !hiddenCloses.has(d.closeType)) ? null : 'none';
             }
             return null;
@@ -584,7 +902,7 @@ export function updateOverviewInvalidVisibility() {
             if (d.kind === 'invalid') {
                 return (noReasonHidden || !d.reason || !hiddenReasons.has(d.reason)) ? null : 0;
             }
-            if (d.kind === 'closing') {
+            if (d.kind === 'closing' || d.kind === 'ongoing') {
                 return (noCloseHidden || !d.closeType || !hiddenCloses.has(d.closeType)) ? null : 0;
             }
             return null;

@@ -369,7 +369,19 @@ def detect_tcp_flows(records, selected_ips=None):
                 flow['closeType'] = 'invalid'
         elif flow['state'] == 'closing':
             flow['state'] = 'closed'
-        
+
+        # Mark ongoing flows explicitly (non-invalid, not gracefully/abortively closed)
+        # Ongoing = reached establishment or data, no RST/FIN completion observed
+        if (
+            flow['state'] not in ('invalid', 'closed', 'aborted')
+            and not flow.get('closeType')  # no graceful/abortive/invalid close type
+            and (flow.get('establishmentComplete') or flow.get('dataTransferStarted'))
+        ):
+            flow['state'] = 'ongoing'
+            flow['ongoing'] = True
+            # Label close type as 'open' for downstream consumers; UI maps non-graceful/abortive to Unknown
+            flow['closeType'] = 'open'
+
         # HTML adds ALL flows, no filtering (line 3850: flows.push(flow))
         flows.append(flow)
     
@@ -481,7 +493,8 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
                 'flow_invalid_reason': flow.get('invalidReason', ''),
                 'establishment_packets': len(flow['phases']['establishment']),
                 'data_transfer_packets': len(flow['phases']['dataTransfer']),
-                'closing_packets': len(flow['phases']['closing'])
+                'closing_packets': len(flow['phases']['closing']),
+                'flow_ongoing': flow.get('ongoing', False)
             }
     
     # Enhanced packet records with flow information
@@ -528,6 +541,7 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
             'establishment_packets': flow_info.get('establishment_packets', 0),
             'data_transfer_packets': flow_info.get('data_transfer_packets', 0),
             'closing_packets': flow_info.get('closing_packets', 0),
+            'flow_ongoing': flow_info.get('flow_ongoing', False),
             
             # Source IP statistics
             'src_sent_packets': src_stats.get('sent_packets', 0),
