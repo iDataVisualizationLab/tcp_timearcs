@@ -1,7 +1,8 @@
 # Ignore CSV data files
 *.csv
+!GroundTruth_UTC_naive.csv
 
 # Ignore hidden files (dotfiles) but keep this file
 .*
+._*
 !.gitignore
-
