@@ -1,5 +1,6 @@
 // Overview chart module: manages stacked invalid flows overview, brush, and legends
 import { GLOBAL_BIN_COUNT } from './config.js';
+import { createOverviewFlowLegend } from './legends.js';
 // Internal state
 let overviewSvg, overviewXScale, overviewBrush, overviewWidth = 0, overviewHeight = 100;
 let isUpdatingFromBrush = false; // prevent circular updates
@@ -53,7 +54,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
 
     // Align overview with main chart: use identical inner width and left/right margins
     const chartMargins = margins || (getChartMarginsRef ? getChartMarginsRef() : { left: 150, right: 120, top: 80, bottom: 50 });
-    const overviewMargin = { top: 10, right: chartMargins.right, bottom: 30, left: chartMargins.left };
+    const legendHeight = 35; // Space for horizontal legend
+    const overviewMargin = { top: 15 + legendHeight, right: chartMargins.right, bottom: 30, left: chartMargins.left };
     overviewWidth = Math.max(100, width);
     overviewHeight = 100;
 
@@ -597,165 +599,13 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         }
     } catch {}
 
-    // Legends
-    try {
-        const panel = document.getElementById('invalidLegendPanel');
-        if (panel) {
-            const legendReasons = [
-                'invalid_ack',
-                'rst_during_handshake',
-                'incomplete_no_synack',
-                'incomplete_no_ack',
-                'invalid_synack',
-                'unknown_invalid'
-            ];
-            const totalsByReason = new Map(legendReasons.map(r => [r, 0]));
-            for (const f of invalidFlows) {
-                let r = getInvalidReason(f);
-                if (!r) r = 'unknown_invalid';
-                if (totalsByReason.has(r)) totalsByReason.set(r, totalsByReason.get(r) + 1);
-            }
-            const totalAll = Array.from(totalsByReason.values()).reduce((a, b) => a + b, 0);
-            const itemsHtml = legendReasons.map(r => {
-                const color = (invalidFlowColors[r] || '#6c757d');
-                const label = (invalidLabels[r] || 'Invalid');
-                const count = (totalsByReason.get(r) || 0);
-                return `<div class="invalid-legend-item" data-reason="${r}" style="display:flex; align-items:center; gap:8px; margin:4px 0; cursor:default;">
-                            <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:${color}; border:1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.1);"></span>
-                            <span style="flex:1; color:#333;">${label}</span>
-                            <span style="color:#555;">${count}</span>
-                        </div>`;
-            }).join('');
-            sbRenderInvalidLegendRef(panel, itemsHtml || '<div style="color:#666;">No invalid flows</div>', `Invalid flows: ${totalAll}`);
-            try {
-                const tooltipSel = d3.select('#tooltip');
-                panel.querySelectorAll('.invalid-legend-item').forEach((el) => {
-                    const reason = el.getAttribute('data-reason');
-                    el.style.cursor = 'pointer';
-                    el.addEventListener('click', () => {
-                        if (!reason) return;
-                        const setRef = hiddenInvalidReasonsRef;
-                        if (setRef.has(reason)) setRef.delete(reason); else setRef.add(reason);
-                        try { updateOverviewInvalidVisibility(); } catch {}
-                        // Also apply to main arc graph without rebinning
-                        try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
-                    });
-                    el.addEventListener('mouseover', (event) => {
-                        tooltipSel.style('display', 'block').html(`<b>${invalidLabels[reason] || 'Invalid'}</b>`);
-                    });
-                    el.addEventListener('mousemove', (event) => {
-                        tooltipSel.style('left', `${event.pageX + 12}px`).style('top', `${event.pageY - 8}px`);
-                    });
-                    el.addEventListener('mouseout', () => {
-                        tooltipSel.style('display', 'none');
-                    });
-                });
-            } catch {}
-        }
-    } catch (e) {}
-
-    try {
-        const flowsAll = Array.isArray(getCurrentFlowsRef()) ? getCurrentFlowsRef() : [];
-        const isInvalid = (f) => f && (f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason);
-        const isClosedGraceful = (f) => f && f.closeType === 'graceful';
-        const isClosedAbortive = (f) => f && f.closeType === 'abortive';
-        const isClosed = (f) => isClosedGraceful(f) || isClosedAbortive(f);
-        const isOngoingCandidate = (f) => f && !isInvalid(f) && !isClosed(f);
-        const isOpen = (f) => isOngoingCandidate(f) && (f.establishmentComplete === true || f.state === 'established' || f.state === 'data_transfer');
-        const isIncomplete = (f) => isOngoingCandidate(f) && !isOpen(f);
-
-        const graceful = flowsAll.filter(isClosedGraceful).length;
-        const abortive = flowsAll.filter(isClosedAbortive).length;
-        const openCount = flowsAll.filter(isOpen).length;
-        const incompleteCount = flowsAll.filter(isIncomplete).length;
-
-        // Closing legend (graceful/abortive only)
-        const cpanel = document.getElementById('closingLegendPanel');
-        if (cpanel) {
-            const closeEntries = [
-                { type: 'graceful', label: 'Graceful closes', color: ((flowColors.closing && flowColors.closing.graceful) || '#8e44ad'), count: graceful },
-                { type: 'abortive', label: 'Abortive (RST)', color: ((flowColors.closing && flowColors.closing.abortive) || '#c0392b'), count: abortive }
-            ];
-            const totalClosed = graceful + abortive;
-            const closeItemsHtml = closeEntries.map(e => `
-                <div class="closing-legend-item" data-type="${e.type}" style="display:flex; align-items:center; gap:8px; margin:4px 0; cursor:pointer;">
-                    <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${e.color}; border:1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.1);"></span>
-                    <span style="flex:1; color:#333;">${e.label}</span>
-                    <span style="color:#555;">${e.count}</span>
-                </div>
-            `).join('');
-            sbRenderClosingLegendRef(cpanel, closeItemsHtml || '<div style="color:#666;">No closing data</div>', `Closing types (flows: ${totalClosed})`);
-            const tooltipSel = d3.select('#tooltip');
-            cpanel.querySelectorAll('.closing-legend-item').forEach((el) => {
-                el.addEventListener('click', () => {
-                    const t = el.getAttribute('data-type');
-                    if (!t) return;
-                    const setRef = hiddenCloseTypesRef;
-                    if (setRef.has(t)) setRef.delete(t); else setRef.add(t);
-                    try { updateOverviewInvalidVisibility(); } catch {}
-                    try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
-                });
-                el.addEventListener('mouseover', (event) => {
-                    const t = el.getAttribute('data-type');
-                    const label = t === 'graceful' ? 'Graceful closes' : (t === 'abortive' ? 'Abortive (RST)' : '');
-                    const tip = t === 'graceful' ? 'Connection closed via FIN/ACK sequence.' : 'Connection terminated by RST (abortive).';
-                    tooltipSel.style('display', 'block').html(`<b>${label}</b><br>${tip}`);
-                });
-                el.addEventListener('mousemove', (event) => {
-                    tooltipSel.style('left', `${event.pageX + 12}px`).style('top', `${event.pageY - 8}px`);
-                });
-                el.addEventListener('mouseout', () => {
-                    tooltipSel.style('display', 'none');
-                });
-            });
-        }
-
-        // Ongoing legend (separate: Open vs Incomplete)
-        const opanel = document.getElementById('ongoingLegendPanel');
-        if (opanel) {
-            const ongoingEntries = [
-                { type: 'open', label: 'Open (established)', color: (flowColors.ongoing && flowColors.ongoing.open) || '#6c757d', count: openCount, tip: 'Handshake completed, no closing observed in range.' }
-            ];
-            const oHtml = ongoingEntries.map(e => `
-                <div class="closing-legend-item" data-type="${e.type}" style="display:flex; align-items:center; gap:8px; margin:4px 0; cursor:pointer;">
-                    <span style="display:inline-block; width:10px; height:10px; border-radius:2px; background:${e.color}; border:1px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,0.1);"></span>
-                    <span style="flex:1; color:#333;">${e.label}</span>
-                    <span style="color:#555;">${e.count}</span>
-                </div>`).join('');
-            const totalOngoing = openCount;
-            sbRenderClosingLegendRef(opanel, oHtml || '<div style="color:#666;">No ongoing flows</div>', `Ongoing flows (open): ${totalOngoing}`);
-
-            const tooltipSel = d3.select('#tooltip');
-            opanel.querySelectorAll('.closing-legend-item').forEach((el) => {
-                el.addEventListener('click', () => {
-                    const t = el.getAttribute('data-type');
-                    if (!t) return;
-                    const setRef = hiddenCloseTypesRef;
-                    if (setRef.has(t)) setRef.delete(t); else setRef.add(t);
-                    try { updateOverviewInvalidVisibility(); } catch {}
-                    try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
-                });
-                el.addEventListener('mouseover', (event) => {
-                    const t = el.getAttribute('data-type');
-                    const entry = ongoingEntries.find(e => e.type === t);
-                    if (!entry) return;
-                    tooltipSel.style('display', 'block').html(`<b>${entry.label}</b><br>${entry.tip}`);
-                });
-                el.addEventListener('mousemove', (event) => {
-                    tooltipSel.style('left', `${event.pageX + 12}px`).style('top', `${event.pageY - 8}px`);
-                });
-                el.addEventListener('mouseout', () => {
-                    tooltipSel.style('display', 'none');
-                });
-            });
-        }
-    } catch {}
+    // Note: Flow legends now displayed horizontally above the chart instead of in sidebar
 
     const overviewXAxis = d3.axisBottom(overviewXScale)
-        .ticks(6)
         .tickFormat(d => {
-            const date = new Date(Math.floor(d) / 1000);
-            return date.toISOString().split('T')[1].substring(0, 5);
+            const timestampInt = Math.floor(d);
+            const date = new Date(timestampInt / 1000);
+            return date.toISOString().split('T')[1].split('.')[0];
         });
 
     // Place the time axis below the bar area to avoid overlap with invalid bars
@@ -812,6 +662,34 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         custom.select('.overview-handle.left').call(d3.drag().on('drag', (event) => { const x0 = event.x; const [, x1] = getSel(); moveBrushTo(x0, x1); updateCustomFromSel(); }));
         custom.select('.overview-handle.right').call(d3.drag().on('drag', (event) => { const x1 = event.x; const [x0] = getSel(); moveBrushTo(x0, x1); updateCustomFromSel(); }));
         custom.select('.overview-window-grab').call(d3.drag().on('drag', (event) => { const [x0, x1] = getSel(); moveBrushTo(x0 + event.dx, x1 + event.dx); updateCustomFromSel(); }));
+    }
+
+    // Create horizontal flow legend above the chart
+    try {
+        createOverviewFlowLegend({
+            svg: overviewSvg,
+            width: overviewWidth,
+            height: overviewHeight,
+            flowColors: flowColors,
+            flows: allFlows,
+            hiddenInvalidReasons: hiddenInvalidReasonsRef,
+            hiddenCloseTypes: hiddenCloseTypesRef,
+            d3: d3,
+            onToggleReason: (reason) => {
+                const setRef = hiddenInvalidReasonsRef;
+                if (setRef.has(reason)) setRef.delete(reason); else setRef.add(reason);
+                try { updateOverviewInvalidVisibility(); } catch {}
+                try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+            },
+            onToggleCloseType: (closeType) => {
+                const setRef = hiddenCloseTypesRef;
+                if (setRef.has(closeType)) setRef.delete(closeType); else setRef.add(closeType);
+                try { updateOverviewInvalidVisibility(); } catch {}
+                try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+            }
+        });
+    } catch (error) {
+        console.warn('Failed to create overview flow legend:', error);
     }
 
     try { updateOverviewInvalidVisibility(); } catch {}
@@ -886,6 +764,8 @@ export function updateOverviewInvalidVisibility() {
     const hiddenCloses = hiddenCloseTypesRef;
     const noReasonHidden = !hiddenReasons || hiddenReasons.size === 0;
     const noCloseHidden = !hiddenCloses || hiddenCloses.size === 0;
+    
+    // Update chart segments
     overviewSvg.selectAll('.overview-stack-segment')
         .style('display', d => {
             if (!d) return null;
@@ -906,5 +786,21 @@ export function updateOverviewInvalidVisibility() {
                 return (noCloseHidden || !d.closeType || !hiddenCloses.has(d.closeType)) ? null : 0;
             }
             return null;
+        });
+    
+    // Update legend to reflect hidden state
+    overviewSvg.selectAll('.overview-flow-legend .legend-item')
+        .style('opacity', function() {
+            const item = d3Ref.select(this);
+            const data = item.datum();
+            if (!data) return 1.0;
+            
+            let hidden = false;
+            if (data.type === 'invalid') {
+                hidden = hiddenReasons && hiddenReasons.has(data.key);
+            } else if (data.type === 'closing' || data.type === 'ongoing') {
+                hidden = hiddenCloses && hiddenCloses.has(data.key);
+            }
+            return hidden ? 0.4 : 1.0;
         });
 }

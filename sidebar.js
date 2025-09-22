@@ -1,5 +1,6 @@
 // Sidebar logic for IP Connection Analysis
 // This file contains all logic for the sidebar UI and its event handlers
+import { getFlowColors, getInvalidLabels, getInvalidReason, getFlowColor } from './legends.js';
 
 export function initSidebar(options) {
     // options: { onResetView, ... }
@@ -205,41 +206,16 @@ export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimest
     }
     const sorted = [...flows].sort((a,b)=>a.startTime - b.startTime);
 
-    const closeColors = {
-        graceful: (flowColors.closing && flowColors.closing.graceful) || '#8e44ad',
-        abortive: (flowColors.closing && flowColors.closing.abortive) || '#c0392b'
-    };
-    const invalidLabels = {
-        'invalid_ack': 'Invalid ACK',
-        'rst_during_handshake': 'RST during handshake',
-        'incomplete_no_synack': 'Incomplete (no SYN+ACK)',
-        'incomplete_no_ack': 'Incomplete (no ACK)',
-        'invalid_synack': 'Invalid SYN+ACK',
-        'unknown_invalid': 'Invalid (unspecified)'
-    };
-    const getInvalidReason = (f) => {
-        if (!f) return null;
-        let r = f.invalidReason;
-        if (!r && (f.closeType === 'invalid' || f.state === 'invalid')) r = 'unknown_invalid';
-        return r || null;
-    };
-    const getFlowColor = (f) => {
-        const reason = getInvalidReason(f);
-        if (reason) {
-            return (flowColors.invalid && flowColors.invalid[reason]) || '#6c757d';
-        }
-        if (f && (f.closeType === 'graceful' || f.closeType === 'abortive')) {
-            return closeColors[f.closeType] || '#6c757d';
-        }
-        return '#adb5bd'; // neutral grey for unknown/ongoing
-    };
+    // Use flow legend helpers from legends.js
+    const closeColors = getFlowColors(flowColors);
+    const invalidLabels = getInvalidLabels();
     let html = '';
     sorted.forEach(flow => {
         const duration = Math.round((flow.endTime - flow.startTime) / 1000000);
         const { utcTime: startTime } = formatTimestamp(flow.startTime);
         const { utcTime: endTime } = formatTimestamp(flow.endTime);
         const reason = getInvalidReason(flow);
-        const color = getFlowColor(flow);
+        const color = getFlowColor(flow, flowColors);
         let closeTypeText = '';
         if (reason) {
             const label = invalidLabels[reason] || 'Invalid';
@@ -364,12 +340,4 @@ export function updateGroundTruthStatsUI(html, ok=true) {
     container.style.color = ok ? '#27ae60' : '#e74c3c';
 }
 
-export function renderInvalidLegend(panelEl, legendItemsHtml, totalText) {
-    if (!panelEl) return;
-    panelEl.innerHTML = `<div style="font-weight:600; margin-bottom:6px;">${totalText}</div>${legendItemsHtml}`;
-}
 
-export function renderClosingLegend(panelEl, legendItemsHtml, totalText) {
-    if (!panelEl) return;
-    panelEl.innerHTML = `<div style="font-weight:600; margin-bottom:6px;">${totalText}</div>${legendItemsHtml}`;
-}

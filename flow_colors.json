@@ -1,14 +1,14 @@
 {
   "closing": {
-    "graceful": "#4daf4a",
-    "abortive": "#e41a1c"
+    "graceful": "#66bb6a",
+    "abortive": "#2e7d32"
   },
   "invalid": {
-    "invalid_ack": "#477415",
-    "invalid_synack": "#a11c60",
-    "rst_during_handshake": "#984201",
-    "incomplete_no_synack": "#136f53",
-    "incomplete_no_ack": "#a11c60",
-    "unknown_invalid": "#4d4d4d"
+    "invalid_ack": "#ff0000",
+    "invalid_synack": "#ff3300",
+    "rst_during_handshake": "#ff6600",
+    "incomplete_no_synack": "#ff9900",
+    "incomplete_no_ack": "#ffcc00",
+    "unknown_invalid": "#ffff00"
   }
 }
