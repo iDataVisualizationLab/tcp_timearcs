@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>TCP Analysis</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
@@ -16,6 +16,29 @@
             display: grid;
             grid-template-rows: auto 1fr; /* header + main layout */
             overflow: hidden; /* prevent page scroll; columns will scroll */
+            min-width: 800px; /* Ensure minimum width for visualization */
+        }
+        
+        /* Responsive adjustments */
+        @media (max-width: 1200px) {
+            #sidebar {
+                flex: 0 0 300px;
+            }
+        }
+        
+        @media (max-width: 900px) {
+            #main-layout {
+                flex-direction: column;
+            }
+            
+            #sidebar {
+                flex: 0 0 auto;
+                max-height: 400px;
+            }
+            
+            body {
+                min-width: 600px;
+            }
         }
         h1 {
             color: #343a40;
@@ -37,9 +60,10 @@
         }
         #chart-container {
             flex: 1 1 auto;
-            min-width: 0;
+            min-width: 400px; /* Ensure minimum width for chart */
             overflow-y: auto; /* chart area scrolls independently */
             -webkit-overflow-scrolling: touch;
+            position: relative; /* Needed for resize handling */
         }
         #sidebar {
             flex: 0 0 360px;
@@ -300,6 +324,17 @@
             font-weight: bold;
             fill: #495057;
             text-anchor: middle;
+        }
+        
+        /* SVG responsive styles */
+        svg {
+            max-width: 100%;
+            height: auto;
+        }
+        
+        #chart svg {
+            display: block;
+            width: 100%;
         }
 
     </style>

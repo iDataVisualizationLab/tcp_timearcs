@@ -494,40 +494,197 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Keep bottom overlay aligned on window resize without changing scales
-    try {
-        window.addEventListener('resize', () => {
-            try {
-                const container = d3.select("#chart-container").node();
-                if (!container) return;
-                const newWidth = container.clientWidth - chartMarginLeft - chartMarginRight;
-                if (typeof newWidth === 'number' && newWidth > 0) {
-                    bottomOverlayWidth = Math.max(0, newWidth + chartMarginLeft + chartMarginRight);
-                    d3.select('#chart-bottom-overlay-svg')
-                        .attr('width', bottomOverlayWidth)
-                        .attr('height', bottomOverlayHeight);
-                    if (bottomOverlayRoot) bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
-                    if (bottomOverlayAxisGroup && xScale) {
-                        const axis = d3.axisBottom(xScale).tickFormat(d => {
-                            const timestampInt = Math.floor(d);
-                            const date = new Date(timestampInt / 1000);
-                            return date.toISOString().split('T')[1].split('.')[0];
-                        });
-                        bottomOverlayAxisGroup.call(axis);
-                    }
-                                // Redraw legends into overlay at new width anchored above axis
-                                const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
-                                if (bottomOverlayDurationLabel) bottomOverlayDurationLabel.attr('y', axisBaseY - 12);
-                                try { drawSizeLegend(bottomOverlayRoot, newWidth, bottomOverlayHeight, axisBaseY); } catch {}
-                                try { drawFlagLegend(); } catch {}
-                }
-            } catch(_) {}
-        });
-    } catch(_) {}
+    // Window resize handler for responsive visualization
+    setupWindowResizeHandler();
 });
 
 // Load ground truth data in the background
 loadGroundTruthData();
+
+// Window resize handler for responsive visualization
+function setupWindowResizeHandler() {
+    let resizeTimeout;
+    
+    const handleResize = () => {
+        // Clear existing timeout to debounce rapid resize events
+        clearTimeout(resizeTimeout);
+        
+        resizeTimeout = setTimeout(() => {
+            try {
+                // Only proceed if we have data and existing visualization
+                if (!fullData || fullData.length === 0 || !svg || !xScale || !yScale) {
+                    return;
+                }
+                
+                LOG('Handling window resize, updating visualization dimensions');
+                
+                // Store old dimensions for comparison
+                const oldWidth = width;
+                const oldHeight = height;
+                
+                const container = d3.select("#chart-container").node();
+                if (!container) return;
+                
+                // Calculate new dimensions
+                const containerRect = container.getBoundingClientRect();
+                const newWidth = Math.max(400, containerRect.width - chartMarginLeft - chartMarginRight);
+                const newHeight = Math.max(300, containerRect.height - 100); // Leave space for controls
+                
+                // Update global dimensions
+                width = newWidth;
+                height = newHeight;
+                
+                LOG(`Resize: ${oldWidth}x${oldHeight} -> ${width}x${height}`);
+                
+                // Resize main SVG
+                svg.attr('width', width + chartMarginLeft + chartMarginRight)
+                   .attr('height', height + 100); // Extra space for bottom margin
+                
+                // Update scales with new width
+                if (xScale && timeExtent) {
+                    xScale.range([0, width]);
+                }
+                
+                // Update bottom overlay dimensions
+                bottomOverlayWidth = Math.max(0, newWidth + chartMarginLeft + chartMarginRight);
+                d3.select('#chart-bottom-overlay-svg')
+                    .attr('width', bottomOverlayWidth)
+                    .attr('height', bottomOverlayHeight);
+                
+                if (bottomOverlayRoot) {
+                    bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
+                }
+                
+                // Update main chart axis and legends
+                if (bottomOverlayAxisGroup && xScale) {
+                    const axis = d3.axisBottom(xScale).tickFormat(d => {
+                        const timestampInt = Math.floor(d);
+                        const date = new Date(timestampInt / 1000);
+                        return date.toISOString().split('T')[1].split('.')[0];
+                    });
+                    bottomOverlayAxisGroup.call(axis);
+                    
+                    // Redraw legends with new dimensions
+                    const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
+                    if (bottomOverlayDurationLabel) {
+                        bottomOverlayDurationLabel.attr('y', axisBaseY - 12);
+                    }
+                    
+                    try { 
+                        drawSizeLegend(bottomOverlayRoot, newWidth, bottomOverlayHeight, axisBaseY); 
+                    } catch (e) { 
+                        LOG('Error redrawing size legend:', e); 
+                    }
+                    
+                    try { 
+                        drawFlagLegend(); 
+                    } catch (e) { 
+                        LOG('Error redrawing flag legend:', e); 
+                    }
+                }
+                
+                // Update zoom behavior with new dimensions
+                if (zoom && zoomTarget) {
+                    const currentTransform = d3.zoomTransform(zoomTarget.node());
+                    zoom.extent([[0, 0], [width, height]])
+                        .scaleExtent([1, Math.max(20, width / 50)]);
+                    
+                    // Clear the cache to force fresh calculations
+                    fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false };
+                    
+                    // Also increment data version to invalidate other caches
+                    dataVersion++;
+                    
+                    // Clear cached selections to force fresh rendering
+                    dotsSelection = null;
+                    
+                    // Trigger the zoom event handler to redraw everything with new scale
+                    // We need to dispatch a zoom event to trigger the redraw
+                    const event = new CustomEvent('zoom');
+                    event.transform = currentTransform;
+                    event.sourceEvent = { type: 'resize' };
+                    
+                    // Get the zoom handler function and call it
+                    const zoomHandler = zoom.on('zoom');
+                    if (typeof zoomHandler === 'function') {
+                        try {
+                            LOG('Calling zoom handler to redraw with new dimensions');
+                            zoomHandler.call(zoomTarget.node(), event);
+                            LOG('Zoom handler called successfully');
+                        } catch (e) {
+                            LOG('Error calling zoom handler directly:', e);
+                            // Fallback: manually trigger zoom transform
+                            zoomTarget.call(zoom.transform, currentTransform);
+                        }
+                    } else {
+                        LOG('Zoom handler not found, using fallback');
+                        // Fallback: manually trigger zoom transform
+                        zoomTarget.call(zoom.transform, currentTransform);
+                    }
+                }
+                
+                // Recreate overview chart with new dimensions
+                if (timeExtent && timeExtent.length === 2) {
+                    try {
+                        createOverviewChart(fullData, {
+                            timeExtent: timeExtent,
+                            width: width,
+                            margins: { left: chartMarginLeft, right: chartMarginRight, top: 80, bottom: 50 }
+                        });
+                        
+                        // Restore brush selection to current zoom domain if available
+                        if (xScale && updateBrushFromZoom) {
+                            updateBrushFromZoom();
+                        }
+                    } catch (e) {
+                        LOG('Error recreating overview chart on resize:', e);
+                    }
+                }
+                
+                // The zoom handler will take care of redrawing dots and arcs
+                // Just need to update any additional elements that aren't handled by zoom
+                
+                // Update clip path with new dimensions
+                if (svg) {
+                    svg.select('#clip rect')
+                        .attr('width', width + 40) // DOT_RADIUS equivalent
+                        .attr('height', height + 80); // 2 * DOT_RADIUS equivalent
+                }
+                
+                // Update global domain for overview sync
+                try { 
+                    window.__arc_x_domain__ = xScale.domain(); 
+                } catch {}
+                
+                LOG('Window resize handling complete - zoom handler will redraw visualization');
+                
+                LOG('Window resize handling complete');
+                
+            } catch (e) {
+                console.warn('Error during window resize:', e);
+            }
+        }, 150); // 150ms debounce delay
+    };
+    
+    // Add resize event listener
+    window.addEventListener('resize', handleResize);
+    
+    // Also handle zoom events from browser (Ctrl+/Ctrl-)
+    window.addEventListener('wheel', (event) => {
+        if (event.ctrlKey || event.metaKey) {
+            // Browser zoom detected, trigger resize after a short delay
+            setTimeout(handleResize, 100);
+        }
+    }, { passive: true });
+    
+    // Handle browser zoom via keyboard shortcuts
+    document.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && (event.key === '+' || event.key === '-' || event.key === '0')) {
+            // Browser zoom shortcut detected
+            setTimeout(handleResize, 100);
+        }
+    });
+}
 
 // Function to convert UTC datetime string to epoch microseconds
 function utcToEpochMicroseconds(utcString) {
@@ -3034,3 +3191,13 @@ function exportFlowToCSV(flow) {
         alert('Failed to export CSV. See console for details.');
     }
 }
+
+// Make resize handler available globally for testing and debugging
+window.setupWindowResizeHandler = setupWindowResizeHandler;
+
+// Test function to manually trigger resize (for debugging)
+window.testResize = function() {
+    console.log('Testing manual resize...');
+    const event = new Event('resize');
+    window.dispatchEvent(event);
+};
