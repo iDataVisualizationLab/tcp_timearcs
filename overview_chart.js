@@ -229,9 +229,8 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         if (total > maxBinTotalOngoing) maxBinTotalOngoing = total;
     }
     maxBinTotalOngoing = Math.max(1, maxBinTotalOngoing);
-    // Shared max values to keep all categories proportional
-    const sharedUpMax = Math.max(1, maxBinTotalClosing, maxBinTotalOngoing);
-    const sharedAllMax = Math.max(sharedUpMax, maxBinTotalInvalid);
+    // Shared max across all bands so bar heights use the same scale
+    const sharedMax = Math.max(1, maxBinTotalClosing, maxBinTotalOngoing, maxBinTotalInvalid);
 
     // Layout heights
     const chartHeightUp = Math.max(10, axisY - 6);
@@ -239,7 +238,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
     const chartHeightUpOngoing = chartHeightUp * 0.45; // lower band (closest to axis)
     const chartHeightUpClosing = chartHeightUp - chartHeightUpOngoing; // remaining top band
     const brushTopY = overviewHeight - 4; // top of brush selection area
-    const chartHeightDown = Math.max(6, brushTopY - axisY - 4); // keep a tiny gap from brush
+    // Push invalid bars down without reducing their total height
+    const invalidAxisGap = 6; // pixels of vertical offset below the axis
+    const chartHeightDown = Math.max(6, brushTopY - axisY - 4); // full available height
 
     // Colors for closing types (top)
     const closeColors = {
@@ -270,7 +271,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mTop.get(t) || [];
                 const count = arr.length;
                 if (count === 0) continue;
-                const h = (count / sharedUpMax) * chartHeightUpClosing;
+                const h = (count / sharedMax) * chartHeightUpClosing;
                 yTop -= h;
                 segments.push({
                     kind: 'closing', closeType: t, reason: null,
@@ -290,7 +291,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mMid.get('open') || [];
                 const count = arr.length;
                 if (count > 0) {
-                    const h = (count / sharedUpMax) * (chartHeightUpOngoing / 2);
+                    const h = (count / sharedMax) * (chartHeightUpOngoing / 2);
                     const y = centerY - h;
                     segments.push({
                         kind: 'ongoing', closeType: 'open', reason: null,
@@ -304,7 +305,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mMid.get('incomplete') || [];
                 const count = arr.length;
                 if (count > 0) {
-                    const h = (count / sharedUpMax) * (chartHeightUpOngoing / 2);
+                    const h = (count / sharedMax) * (chartHeightUpOngoing / 2);
                     const y = centerY;
                     segments.push({
                         kind: 'ongoing', closeType: 'incomplete', reason: null,
@@ -316,7 +317,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         }
 
         // Downward stacking: invalid reasons
-        let yBottom = axisY;
+        let yBottom = axisY + invalidAxisGap;
         const mBot = binReasonMap.get(i) || new Map();
         const totalBot = binTotalsInvalid.get(i) || 0;
         if (totalBot > 0) {
@@ -324,7 +325,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 const arr = mBot.get(reason) || [];
                 const count = arr.length;
                 if (count === 0) continue;
-                const h = (count / sharedAllMax) * chartHeightDown;
+                const h = (count / sharedMax) * chartHeightDown;
                 const y = yBottom; // start at baseline and grow downward
                 yBottom += h;
                 segments.push({
@@ -338,26 +339,58 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
 
     // Amplify/reset functions per band to avoid vertical jumps
     const amplifyBinBand = (binIndex, bandKind) => {
-        const targetSy = 1.8;
+        const targetSy = 1.8; // default magnification
         const axisY = overviewHeight - 30;
 
         const upTotalClose = (binTotalsClosing && binTotalsClosing.get) ? (binTotalsClosing.get(binIndex) || 0) : 0;
         const upTotalOngoing = (binTotalsOngoing && binTotalsOngoing.get) ? (binTotalsOngoing.get(binIndex) || 0) : 0;
         const downTotal = (binTotalsInvalid && binTotalsInvalid.get) ? (binTotalsInvalid.get(binIndex) || 0) : 0;
-        const upHeightClose = (upTotalClose / Math.max(1, sharedUpMax)) * chartHeightUpClosing;
-        const upHeightOngoing = (upTotalOngoing / Math.max(1, sharedUpMax)) * chartHeightUpOngoing;
-        const downHeight = (downTotal / Math.max(1, sharedAllMax)) * chartHeightDown;
+        const upHeightClose = (upTotalClose / Math.max(1, sharedMax)) * chartHeightUpClosing;
+        const upHeightOngoing = (upTotalOngoing / Math.max(1, sharedMax)) * chartHeightUpOngoing;
+        const downHeight = (downTotal / Math.max(1, sharedMax)) * chartHeightDown;
+
+        // Allow extra magnification for very small bands so thin bars are visible
+        const smallBandBoost = (hPx, baseCap) => {
+            if (hPx <= 0.75) return Math.max(baseCap, 6.0);
+            if (hPx <= 1.5) return Math.max(baseCap, 4.0);
+            if (hPx <= 2.5) return Math.max(baseCap, 3.0);
+            return baseCap;
+        };
 
         // Per-band scale and pivot
-        const syClose = Math.max(1.0, upHeightClose > 0 ? Math.min(targetSy, chartHeightUpClosing / Math.max(1e-6, upHeightClose)) : 1.0);
-        const syOngoing = Math.max(1.0, upHeightOngoing > 0 ? Math.min(targetSy, chartHeightUpOngoing / Math.max(1e-6, upHeightOngoing)) : 1.0);
-        const syInvalid = Math.max(1.0, downHeight > 0 ? Math.min(targetSy, chartHeightDown / Math.max(1e-6, downHeight)) : 1.0);
+        const syClose = Math.max(
+            1.0,
+            upHeightClose > 0
+                ? Math.min(
+                    smallBandBoost(upHeightClose, targetSy),
+                    chartHeightUpClosing / Math.max(1e-6, upHeightClose)
+                  )
+                : 1.0
+        );
+        const syOngoing = Math.max(
+            1.0,
+            upHeightOngoing > 0
+                ? Math.min(
+                    smallBandBoost(upHeightOngoing, targetSy),
+                    chartHeightUpOngoing / Math.max(1e-6, upHeightOngoing)
+                  )
+                : 1.0
+        );
+        const syInvalid = Math.max(
+            1.0,
+            downHeight > 0
+                ? Math.min(
+                    smallBandBoost(downHeight, targetSy),
+                    chartHeightDown / Math.max(1e-6, downHeight)
+                  )
+                : 1.0
+        );
         const sxClose = 3.0;
         const sxOngoing = 1.0; // no left-right growth for middle band
         const sxInvalid = 3.0;
         const pivotClose = axisY - chartHeightUpOngoing; // bottom of closing band
         const pivotOngoing = axisY - (chartHeightUpOngoing / 2); // center of ongoing band
-        const pivotInvalid = axisY;                      // baseline
+        const pivotInvalid = axisY + invalidAxisGap;     // baseline offset for invalid
 
         overviewSvg.selectAll('.overview-stack-segment')
             .filter(s => s.binIndex === binIndex && (
@@ -385,9 +418,14 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             .attr('stroke-width', 0.5);
     };
 
-    // Render combined segments
-    overviewSvg.selectAll('.overview-stack-segment')
-        .data(segments)
+    // Create separate groups so we can control layering: invalid (bottom), closing (top band), ongoing (middle, on top of axis)
+    const gInvalid = overviewSvg.append('g').attr('class', 'overview-group-invalid');
+    const gClosing = overviewSvg.append('g').attr('class', 'overview-group-closing');
+    const gOngoing = overviewSvg.append('g').attr('class', 'overview-group-ongoing');
+
+    const renderSegsInto = (groupSel, data) => groupSel
+        .selectAll('.overview-stack-segment')
+        .data(data)
         .enter().append('rect')
         .attr('class', 'overview-stack-segment')
         .attr('x', d => d.x)
@@ -483,6 +521,10 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             if (d.kind === 'closing') return `${d.count} ${d.closeType} close(s)`;
             return `${d.count} ${d.closeType} flow(s)`; // ongoing: open/incomplete
         });
+
+    // Render invalid and closing segments first
+    renderSegsInto(gInvalid, segments.filter(s => s.kind === 'invalid'));
+    renderSegsInto(gClosing, segments.filter(s => s.kind === 'closing'));
 
     // Add generous transparent hit-areas per bin: full column width, full height.
     // We still amplify per-band, but we choose band based on mouse Y within the column.
@@ -608,12 +650,17 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             return date.toISOString().split('T')[1].split('.')[0];
         });
 
-    // Place the time axis below the bar area to avoid overlap with invalid bars
-    const timeAxisY = overviewHeight - 8; // a few px above the bottom/brush
-    overviewSvg.append('g')
+    // Move the time axis to the center of the ongoing band
+    const timeAxisY = (axisY - (chartHeightUpOngoing / 2));
+    // Draw axis below ongoing group so ongoing bars appear on top
+    const axisGroup = overviewSvg.append('g')
         .attr('class', 'overview-axis')
         .attr('transform', `translate(0,${timeAxisY})`)
         .call(overviewXAxis);
+
+    // Ensure ongoing is rendered above axis by moving the group to front
+    renderSegsInto(gOngoing, segments.filter(s => s.kind === 'ongoing'));
+    try { gOngoing.raise(); } catch {}
 
     const bandTop = overviewHeight - 4;
     const bandBottom = overviewHeight;

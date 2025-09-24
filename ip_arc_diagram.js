@@ -2817,7 +2817,16 @@ function visualizeTimeArcs(packets) {
         }, 32);
     };
 
+    // Configure zoom so regular mouse-wheel scroll passes through to the page.
+    // Require Ctrl/Cmd/Shift for wheel-zoom to avoid interfering with vertical scrolling
     zoom = d3.zoom()
+        .filter((event) => {
+            if (!event) return true;
+            if (event.type === 'wheel') {
+                return event.ctrlKey || event.metaKey || event.shiftKey;
+            }
+            return true; // keep drag/pinch and dblclick zoom enabled
+        })
         .scaleExtent([1, 1e9])
         .on("zoom", zoomed);
 
