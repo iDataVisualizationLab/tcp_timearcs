@@ -68,7 +68,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
 
     overviewXScale = d3.scaleLinear().domain(timeExtent).range([0, overviewWidth]);
 
-    const binCount = GLOBAL_BIN_COUNT;
+    const binCount = (typeof GLOBAL_BIN_COUNT === 'number')
+        ? GLOBAL_BIN_COUNT
+        : (GLOBAL_BIN_COUNT.OVERVIEW || GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
     const totalRange = Math.max(1, (timeExtent[1] - timeExtent[0]));
     const timeBinSize = totalRange / binCount;
 

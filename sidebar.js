@@ -117,6 +117,18 @@ export function wireSidebarControls(opts) {
     on('showClosing', 'change', (e) => { if (opts.onToggleClosing) opts.onToggleClosing(e.target.checked); });
     on('showGroundTruth', 'change', (e) => { if (opts.onToggleGroundTruth) opts.onToggleGroundTruth(e.target.checked); });
     on('toggleBinning', 'change', (e) => { if (opts.onToggleBinning) opts.onToggleBinning(e.target.checked); });
+
+    // Render mode radios
+    const modeCircles = document.getElementById('renderModeCircles');
+    const modeBars = document.getElementById('renderModeBars');
+    if (modeCircles && modeBars && opts.onToggleRenderMode) {
+        const handler = () => {
+            const mode = modeBars.checked ? 'bars' : 'circles';
+            opts.onToggleRenderMode(mode);
+        };
+        modeCircles.addEventListener('change', handler);
+        modeBars.addEventListener('change', handler);
+    }
 }
 
 export function updateFlagStats(packets, classifyFlags, flagColors) {
@@ -339,5 +351,4 @@ export function updateGroundTruthStatsUI(html, ok=true) {
     container.innerHTML = html;
     container.style.color = ok ? '#27ae60' : '#e74c3c';
 }
-
 

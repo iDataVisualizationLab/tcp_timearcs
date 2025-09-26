@@ -82,7 +82,7 @@ let bottomOverlayRoot = null;
 let bottomOverlayAxisGroup = null;
 let bottomOverlayDurationLabel = null;
 let bottomOverlayWidth = 0;
-let bottomOverlayHeight = 140; // generous to fit axis + legends; mirrors CSS negative margin
+let bottomOverlayHeight = 140; // generous to fit axis + legends without changing sizes
 let chartMarginLeft = 150;
 let chartMarginRight = 120;
 // Layers for performance tuning: persistent full-domain layer and dynamic zoom layer
@@ -101,7 +101,7 @@ let ipPositions = new Map(); // Global IP positions map
 let ipOrder = []; // Current vertical order of IPs
 // Row layout constants (used for positioning and drag-reorder)
 const ROW_GAP = 50; // vertical gap between IP rows
-const TOP_PAD = 30; // slight top buffer to avoid clipping
+const TOP_PAD = 30; // top padding before first row
 let tcpFlows = []; // Store detected TCP flows (from CSV)
 let currentFlows = []; // Flows matching current IP selection (subset of tcpFlows)
 let selectedFlowIds = new Set(); // Store IDs of selected flows as strings
@@ -129,6 +129,219 @@ let globalMaxBinCount = 1;
 
 // User toggle: binning on/off
 let useBinning = true;
+// Render mode: 'circles' (default) or 'bars'
+let renderMode = 'circles';
+
+// Choose the effective bin count based on render mode and config
+function getEffectiveBinCount() {
+    const cfg = GLOBAL_BIN_COUNT;
+    if (typeof cfg === 'object' && cfg) {
+        // ip_bar_diagram uses BAR bin count by design
+        return cfg.BAR || cfg.BARS || 300;
+    }
+    return (typeof cfg === 'number' ? cfg : 300);
+}
+
+// Helper to compute bar width in pixels from binned data and current xScale
+function computeBarWidthPx(binned) {
+    try {
+        if (!Array.isArray(binned) || binned.length === 0 || !xScale) return 4;
+        const centers = Array.from(new Set(binned.filter(d => d.binned && Number.isFinite(d.binCenter)).map(d => Math.floor(d.binCenter)))).sort((a,b)=>a-b);
+        let gap = 0;
+        for (let i = 1; i < centers.length; i++) {
+            const d = centers[i] - centers[i-1];
+            if (d > 0) { gap = (gap === 0) ? d : Math.min(gap, d); }
+        }
+        if (gap <= 0) {
+            const domain = xScale.domain();
+            const microRange = Math.max(1, domain[1] - domain[0]);
+            gap = Math.floor(microRange / Math.max(1, getEffectiveBinCount()));
+        }
+        const half = Math.max(1, Math.floor(gap / 2));
+        const px = Math.max(2, xScale(centers[0] + half) - xScale(centers[0] - half));
+        return Math.max(2, Math.min(24, px));
+    } catch (_) { return 4; }
+}
+
+// Render stacked bars for binned items into given layer
+function renderBars(layer, binned) {
+    if (!layer) return;
+    try { layer.selectAll('.direction-dot').remove(); } catch {}
+
+    // Build stacks per (timeBin, yPos)
+    const stacks = new Map();
+    const items = (binned || []).filter(d => d && d.binned);
+    const globalFlagTotals = new Map();
+    for (const d of items) {
+        const ft = d.flagType || classifyFlags(d.flags);
+        const c = Math.max(1, d.count || 1);
+        globalFlagTotals.set(ft, (globalFlagTotals.get(ft) || 0) + c);
+    }
+    for (const d of items) {
+        const t = Number.isFinite(d.binCenter) ? Math.floor(d.binCenter) : (Number.isFinite(d.binTimestamp) ? Math.floor(d.binTimestamp) : Math.floor(d.timestamp));
+        const key = `${t}|${d.yPos}`;
+        let s = stacks.get(key);
+        if (!s) { s = { center: t, yPos: d.yPos, byFlag: new Map(), total: 0 }; stacks.set(key, s); }
+        const ft = d.flagType || classifyFlags(d.flags);
+        const prev = s.byFlag.get(ft) || { count: 0, packets: [] };
+        prev.count += Math.max(1, d.count || 1);
+        if (Array.isArray(d.originalPackets)) prev.packets = prev.packets.concat(d.originalPackets);
+        s.byFlag.set(ft, prev);
+        s.total += Math.max(1, d.count || 1);
+    }
+    const data = Array.from(stacks.values());
+    const barWidth = computeBarWidthPx(items);
+    const MAX_BAR_H = Math.max(6, Math.min(ROW_GAP - 28, 16));
+    const hScale = d3.scaleLinear().domain([0, Math.max(1, globalMaxBinCount)]).range([1, MAX_BAR_H]);
+
+    const toSegments = (s) => {
+        const parts = Array.from(s.byFlag.entries()).map(([flag, info]) => ({ flagType: flag, count: info.count, packets: info.packets }));
+        parts.sort((a, b) => {
+            const ga = globalFlagTotals.get(a.flagType) || 0;
+            const gb = globalFlagTotals.get(b.flagType) || 0;
+            if (gb !== ga) return gb - ga;
+            return b.count - a.count;
+        });
+        let acc = 0;
+        return parts.map(p => {
+            const h = hScale(Math.max(1, p.count));
+            const yTop = s.yPos - acc - h;
+            acc += h;
+            return {
+                x: xScale(Math.floor(s.center)) - barWidth / 2,
+                y: yTop,
+                w: barWidth,
+                h,
+                datum: {
+                    binned: true,
+                    count: p.count,
+                    flagType: p.flagType,
+                    yPos: s.yPos,
+                    binCenter: s.center,
+                    originalPackets: p.packets || []
+                }
+            };
+        });
+    };
+
+    // Stack groups
+    const stackJoin = layer.selectAll('.bin-stack').data(data, d => `${Math.floor(d.center)}_${d.yPos}`);
+    const stackEnter = stackJoin.enter().append('g').attr('class', 'bin-stack');
+    const stackMerge = stackEnter.merge(stackJoin)
+        .attr('data-anchor-x', d => xScale(Math.floor(d.center)))
+        .attr('data-anchor-y', d => d.yPos)
+        .attr('transform', null)
+        .on('mouseenter', function (event, d) {
+            const g = d3.select(this);
+            const ax = +g.attr('data-anchor-x') || xScale(Math.floor(d.center));
+            const ay = +g.attr('data-anchor-y') || d.yPos;
+            const sx = 1.4, sy = 1.8;
+            g.raise().attr('transform', `translate(${ax},${ay}) scale(${sx},${sy}) translate(${-ax},${-ay})`);
+        })
+        .on('mouseleave', function () {
+            d3.select(this).attr('transform', null);
+            d3.select('#tooltip').style('display', 'none');
+        });
+
+    // Segments within each stack
+    stackMerge.each(function (s) {
+        const segs = toSegments(s);
+        const segJoin = d3.select(this).selectAll('.bin-bar-segment')
+            .data(segs, d => `${Math.floor(d.datum.binCenter || d.datum.timestamp || 0)}_${d.datum.yPos}_${d.datum.flagType}`);
+        segJoin.enter().append('rect')
+            .attr('class', 'bin-bar-segment')
+            .attr('x', d => d.x)
+            .attr('y', d => d.y)
+            .attr('width', d => d.w)
+            .attr('height', d => d.h)
+            .style('fill', d => flagColors[d.datum.flagType] || flagColors.OTHER)
+            .style('opacity', 0.8)
+            .style('stroke', 'none')
+            .style('cursor', 'pointer')
+            .on('mousemove', (event, d) => {
+                const datum = d.datum || {};
+                const center = Math.floor(datum.binCenter || datum.timestamp || 0);
+                const start = Math.floor(datum.binTimestamp || (center - Math.abs(center - (datum.binTimestamp || center))));
+                const end = Math.floor(start + (center - start) * 2);
+                const { utcTime: cUTC } = formatTimestamp(center);
+                const { utcTime: sUTC } = formatTimestamp(start);
+                const { utcTime: eUTC } = formatTimestamp(end);
+                const count = datum.count || 0;
+                const ft = datum.flagType || 'OTHER';
+                const bytes = formatBytes((datum.totalBytes || 0));
+                let tooltipHTML = `<b>${ft}</b><br>Count: ${count}<br>Center: ${cUTC}`;
+                if (start && end) tooltipHTML += `<br>Window: ${sUTC} → ${eUTC}`;
+                tooltipHTML += `<br>Bytes: ${bytes}`;
+                d3.select('#tooltip').style('display', 'block').html(tooltipHTML)
+                    .style('left', `${event.pageX + 40}px`).style('top', `${event.pageY - 40}px`);
+            })
+            .on('mouseleave', () => { d3.select('#tooltip').style('display', 'none'); })
+            .merge(segJoin)
+            .attr('x', d => d.x)
+            .attr('y', d => d.y)
+            .attr('width', d => d.w)
+            .attr('height', d => d.h)
+            .style('fill', d => flagColors[d.datum.flagType] || flagColors.OTHER);
+        segJoin.exit().remove();
+    });
+
+    stackJoin.exit().remove();
+}
+
+// Render circles (existing) for binned items into given layer
+function renderCircles(layer, binned, rScale) {
+    if (!layer) return;
+    // Clear bar segments in this layer
+    try { layer.selectAll('.bin-bar-segment').remove(); } catch {}
+    const tooltip = d3.select('#tooltip');
+    layer.selectAll('.direction-dot')
+        .data(binned, d => d.binned ? `bin_${d.timestamp}_${d.yPos}_${d.flagType}` : `${d.src_ip}-${d.dst_ip}-${d.timestamp}`)
+        .join(
+            enter => enter.append('circle')
+                .attr('class', d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
+                .attr('r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
+                .attr('data-orig-r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
+                .attr('fill', d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
+                .attr('cx', d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
+                .attr('cy', d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
+                .style('cursor', 'pointer')
+                .on('mouseover', (event, d) => {
+                    const dot = d3.select(event.currentTarget);
+                    dot.classed('highlighted', true).style('stroke', '#000').style('stroke-width', '2px');
+                    const baseR = +dot.attr('data-orig-r') || +dot.attr('r') || RADIUS_MIN;
+                    dot.attr('r', baseR);
+                    const packet = d.originalPackets ? d.originalPackets[0] : d;
+                    const arcPath = arcPathGenerator(packet);
+                    if (arcPath) {
+                        mainGroup.append('path').attr('class', 'hover-arc').attr('d', arcPath)
+                            .style('stroke', flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
+                            .style('stroke-width', '2px')
+                            .style('stroke-opacity', 0.8).style('fill', 'none').style('pointer-events', 'none');
+                    }
+                    tooltip.style('display', 'block').html(createTooltipHTML(d));
+                })
+                .on('mousemove', e => { tooltip.style('left', `${e.pageX + 40}px`).style('top', `${e.pageY - 40}px`); })
+                .on('mouseout', e => {
+                    const dot = d3.select(e.currentTarget);
+                    dot.classed('highlighted', false).style('stroke', null).style('stroke-width', null);
+                    const baseR = +dot.attr('data-orig-r') || RADIUS_MIN; dot.attr('r', baseR);
+                    mainGroup.selectAll('.hover-arc').remove(); tooltip.style('display', 'none');
+                }),
+            update => update
+                .attr('class', d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
+                .attr('r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
+                .attr('data-orig-r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
+                .attr('fill', d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
+                .attr('cx', d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
+                .attr('cy', d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
+                .style('cursor', 'pointer')
+        );
+}
+
+function renderMarksForLayer(layer, data, rScale) {
+    if (renderMode === 'bars') return renderBars(layer, data);
+    return renderCircles(layer, data, rScale);
+}
 
 // Draw a circle-size legend (bottom-right) for smallest/middle/largest counts
 function drawSizeLegend(targetSvgOverride = null, targetWidth = null, targetHeight = null, axisY = null) {
@@ -397,8 +610,8 @@ function isFlagVisibleByPhase(flagType) {
     return true;
 }
 
-// Initialization function for the arc diagram module
-function initializeArcVisualization() {
+// Initialization function for the bar diagram module
+function initializeBarVisualization() {
     // Initialize overview module with references
     initOverview({
         d3,
@@ -490,6 +703,17 @@ function initializeArcVisualization() {
                 // Fallback to original behavior
                 applyZoomDomain(xScale.domain(), 'program');
             }
+        },
+        onToggleRenderMode: (mode) => {
+            try {
+                renderMode = (mode === 'bars') ? 'bars' : 'circles';
+                // Re-render marks in current domain using chosen mode
+                isHardResetInProgress = true;
+                visualizeTimeArcs(filteredData);
+                updateTcpFlowPacketsGlobal();
+                drawSelectedFlowArcs();
+                applyInvalidReasonFilter();
+            } catch (e) { console.warn('Render mode toggle failed', e); }
         }
     });
 
@@ -532,9 +756,9 @@ function setupWindowResizeHandler() {
                 
                 LOG(`Resize: ${oldWidth}x${oldHeight} -> ${width}x${height}`);
                 
-                // Resize main SVG; extend by overlay height so rows continue beneath legends
+                // Resize main SVG
                 svg.attr('width', width + chartMarginLeft + chartMarginRight)
-                   .attr('height', height + bottomOverlayHeight);
+                   .attr('height', height + 100); // Extra space for bottom margin
                 
                 // Update scales with new width
                 if (xScale && timeExtent) {
@@ -644,7 +868,7 @@ function setupWindowResizeHandler() {
                 if (svg) {
                     svg.select('#clip rect')
                         .attr('width', width + 40) // DOT_RADIUS equivalent
-                        .attr('height', height + 80); // allow some overflow; overlay sits above
+                        .attr('height', height + 80); // 2 * DOT_RADIUS equivalent
                 }
                 
                 // Update global domain for overview sync
@@ -802,9 +1026,15 @@ function updateTcpFlowPacketsGlobal() {
     filterPacketsBySelectedFlows();
     // If no flows selected, ensure all dots are visible in both layers
     if (!showTcpFlows || selectedFlowIds.size === 0) {
-        if (fullDomainLayer) fullDomainLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.5);
-        // Clear any stale selection-only dots to prevent size scale misreads
-        if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').remove();
+        if (fullDomainLayer) {
+            fullDomainLayer.selectAll('.direction-dot').style('display', 'block').style('opacity', 0.5);
+            fullDomainLayer.selectAll('.bin-bar-segment').style('display', 'block').style('opacity', 0.7);
+        }
+        // Clear any stale selection-only marks to prevent size scale misreads
+        if (dynamicLayer) {
+            dynamicLayer.selectAll('.direction-dot').remove();
+            dynamicLayer.selectAll('.bin-bar-segment').remove();
+        }
         // Restore full-domain layer by default when no selection
         if (fullDomainLayer) fullDomainLayer.style('display', null);
         if (dynamicLayer) dynamicLayer.style('display', 'none');
@@ -913,6 +1143,29 @@ function applyInvalidReasonFilter() {
                 .style('display', hide ? 'none' : null)
                 .style('opacity', hide ? 0 : null);
         });
+        // Also apply to stacked bar segments if present
+        mainGroup.selectAll('.bin-bar-segment').each(function(w) {
+            const d = w && w.datum ? w.datum : w; // our bars bind an object {datum}
+            let hide = false;
+            if (!nothingHidden) {
+                if (d && Array.isArray(d.originalPackets) && d.originalPackets.length) {
+                    let allHidden = true;
+                    const arr = d.originalPackets;
+                    const len = Math.min(arr.length, 50);
+                    for (let i = 0; i < len; i++) {
+                        const p = arr[i];
+                        const key = makeConnectionKey(p.src_ip, p.src_port || 0, p.dst_ip, p.dst_port || 0);
+                        if (!keyIsHidden(key)) { allHidden = false; break; }
+                    }
+                    hide = allHidden;
+                }
+            }
+            if (!hide) {
+                const ftype = d && d.flagType ? d.flagType : 'OTHER';
+                hide = !isFlagVisibleByPhase(ftype);
+            }
+            d3.select(this).style('display', hide ? 'none' : null).style('opacity', hide ? 0 : null);
+        });
     }
 
     // Flow arcs (drawn only for selected flows)
@@ -1007,55 +1260,7 @@ function redrawSelectedFlowsView() {
     // Bin using current settings (may resolve to per-packet if sparse)
     const binnedPackets = binPackets(visiblePackets, xScale, yScale, timeExtent);
     const rScale = d3.scaleSqrt().domain([1, Math.max(1, globalMaxBinCount)]).range([RADIUS_MIN, RADIUS_MAX]);
-
-    // Update dots into dynamic layer; mirror the join used in zoom handler
-    const tooltip = d3.select('#tooltip');
-    dynamicLayer.selectAll('.direction-dot')
-        .data(binnedPackets, d => d.binned ? `bin_${d.timestamp}_${d.yPos}_${d.flagType}` : `${d.src_ip}-${d.dst_ip}-${d.timestamp}`)
-        .join(
-            enter => enter.append('circle')
-                .attr('class', d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                .attr('r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                .attr('data-orig-r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                .attr('fill', d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                .attr('cx', d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                .attr('cy', d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-                .style('cursor', 'pointer')
-                .on('mouseover', (event, d) => {
-                    const dot = d3.select(event.currentTarget);
-                    dot.classed('highlighted', true).style('stroke', '#000').style('stroke-width', '2px');
-                    const baseR = +dot.attr('data-orig-r') || +dot.attr('r') || RADIUS_MIN;
-                    dot.attr('r', baseR);
-                    const packet = d.originalPackets ? d.originalPackets[0] : d;
-                    const arcPath = arcPathGenerator(packet);
-                    if (arcPath) {
-                        const count = d && d.count ? d.count : 1;
-                        const thickness = d3.scaleLinear()
-                            .domain([1, Math.max(1, globalMaxBinCount)])
-                            .range([0.5, 8])
-                            .clamp(true)(Math.max(1, count));
-                        mainGroup.append('path').attr('class', 'hover-arc').attr('d', arcPath)
-                            .style('stroke', flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                            .style('stroke-width', `${thickness}px`)
-                            .style('stroke-opacity', 0.8).style('fill', 'none').style('pointer-events', 'none');
-                    }
-                    tooltip.style('display', 'block').html(createTooltipHTML(d));
-                })
-                .on('mousemove', e => { tooltip.style('left', `${e.pageX + 40}px`).style('top', `${e.pageY - 40}px`); })
-                .on('mouseout', e => {
-                    const dot = d3.select(e.currentTarget);
-                    dot.classed('highlighted', false).style('stroke', null).style('stroke-width', null);
-                    const baseR = +dot.attr('data-orig-r') || RADIUS_MIN; dot.attr('r', baseR);
-                    mainGroup.selectAll('.hover-arc').remove(); tooltip.style('display', 'none');
-                }),
-            update => update
-                .attr('class', d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                .attr('r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                .attr('data-orig-r', d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                .attr('fill', d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                .attr('cx', d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                .attr('cy', d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-        );
+    renderMarksForLayer(dynamicLayer, binnedPackets, rScale);
 
     // After redraw, recompute sizes based on what is actually visible
     setTimeout(() => { try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch(_) {} }, 80);
@@ -1083,6 +1288,8 @@ function legacyFilterPacketsBySelectedFlows() {
     const allDots = mainGroup.selectAll('.direction-dot');
     if (!showTcpFlows || selectedFlowIds.size === 0) {
         allDots.style('display', 'block').style('opacity', 0.5);
+        // Bars as well
+        try { mainGroup.selectAll('.bin-bar-segment').style('display','block').style('opacity', 0.7); } catch {}
         return;
     }
     const selectedKeys = buildSelectedFlowKeySet();
@@ -1114,6 +1321,32 @@ function legacyFilterPacketsBySelectedFlows() {
         }
     }
     requestAnimationFrame(() => processBatch(0));
+
+    // Apply same logic for bar segments based on their bound datum
+    const barNodes = mainGroup.selectAll('.bin-bar-segment').nodes();
+    const BATCH2 = 2000;
+    function processBars(start) {
+        const end = Math.min(start + BATCH2, barNodes.length);
+        for (let i = start; i < end; i++) {
+            const node = barNodes[i];
+            const w = node.__data__;
+            const d = w && w.datum ? w.datum : w;
+            let match = false;
+            if (d && Array.isArray(d.originalPackets)) {
+                const arr = d.originalPackets;
+                const len = Math.min(arr.length, 50);
+                for (let j = 0; j < len; j++) {
+                    const p = arr[j];
+                    const key = makeConnectionKey(p.src_ip, p.src_port, p.dst_ip, p.dst_port);
+                    if (selectedKeys.has(key)) { match = true; break; }
+                }
+            }
+            node.style.display = match ? 'block' : 'none';
+            node.style.opacity = match ? 0.7 : 0.1;
+        }
+        if (end < barNodes.length) requestAnimationFrame(() => processBars(end));
+    }
+    requestAnimationFrame(() => processBars(0));
 }
 
 // Function to draw persistent lines for selected flows
@@ -1149,8 +1382,7 @@ function drawSelectedFlowArcs() {
     const relevantTimeRange = Math.max(1, currentDomain[1] - currentDomain[0]);
     const binSizeCandidate = getBinSize(zoomLevel, relevantTimeRange);
     const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
-    const ARC_BIN_COUNT = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
-    const estBins = Math.max(1, Math.min(ARC_BIN_COUNT, Math.floor(typeof width === 'number' ? width : ARC_BIN_COUNT)));
+    const estBins = Math.max(1, Math.min(getEffectiveBinCount(), Math.floor(typeof width === 'number' ? width : getEffectiveBinCount())));
     const expectedPktsPerBin = visiblePackets.length / estBins;
     const doBinning = (binSizeCandidate !== 0) && (binSizeCandidate > microsPerPixel) && (expectedPktsPerBin >= 1.15);
 
@@ -1214,7 +1446,7 @@ function drawSelectedFlowArcs() {
                 .attr("d", path)
                 .style("stroke", flagColors[ftype] || flagColors.OTHER)
                 .style("stroke-width", `${thickness}px`)
-                .style("opacity", 0.12)
+                .style("opacity", 0.5)
                 .datum(g);
 
             // Add interactivity: show packet info on hover
@@ -1564,6 +1796,17 @@ function recomputeGlobalMaxBinCountFromVisibleDots() {
         const opacity = parseFloat(sel.style('opacity'));
         if (display === 'none' || opacity === 0) return;
         if (d.binned && d.count > 0) {
+            if (d.count > maxCount) maxCount = d.count;
+        }
+    });
+    // Consider bars too
+    activeLayer.selectAll('.bin-bar-segment').each(function(w) {
+        const d = w && w.datum ? w.datum : w;
+        const sel = d3.select(this);
+        const display = sel.style('display');
+        const opacity = parseFloat(sel.style('opacity'));
+        if (display === 'none' || opacity === 0) return;
+        if (d && d.binned && d.count > 0) {
             if (d.count > maxCount) maxCount = d.count;
         }
     });
@@ -2109,8 +2352,7 @@ function getBinSize(zoomLevel, timeRangeMicroseconds, basePixelSize = 5) {
     // If binning is disabled, return 0 to indicate individual packets
     if (!useBinning) return 0;
     const timeRangeSeconds = Math.max(1, timeRangeMicroseconds / 1000000); // avoid zero
-    const ARC_BIN_COUNT = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
-    const binSeconds = timeRangeSeconds / ARC_BIN_COUNT; // seconds per bin
+    const binSeconds = timeRangeSeconds / getEffectiveBinCount(); // seconds per bin
     const binMicroseconds = Math.max(1, Math.floor(binSeconds * 1000000));
     return binMicroseconds;
 }
@@ -2136,8 +2378,7 @@ function binPackets(packets, xScale, yScale, timeExtent) {
     const binSize = getBinSize(zoomLevel, relevantTimeRange);
     // When a bin would be smaller than ~1 pixel OR density is < ~1 pkt/bin, show individual packets
     const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
-    const ARC_BIN_COUNT2 = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
-    const estBins = Math.max(1, Math.min(ARC_BIN_COUNT2, Math.floor(typeof width === 'number' ? width : ARC_BIN_COUNT2)));
+    const estBins = Math.max(1, Math.min(getEffectiveBinCount(), Math.floor(typeof width === 'number' ? width : getEffectiveBinCount())));
     const expectedPktsPerBin = packets.length / estBins;
     const disableBinning = (binSize === 0) || (binSize <= microsPerPixel) || (expectedPktsPerBin < 1.15);
     
@@ -2580,8 +2821,7 @@ function visualizeTimeArcs(packets) {
     } catch {}
     fullDomainBinsCache = { version: dataVersion, data: [], binSize: null, sorted: false };
 
-    // Small top margin to prevent clipping at the window edge
-    const margin = {top: 8, right: 120, bottom: 50, left: 150};
+    const margin = {top: 80, right: 120, bottom: 50, left: 150};
     width = d3.select("#chart-container").node().clientWidth - margin.left - margin.right;
 
     const DOT_RADIUS = 40;
@@ -2615,10 +2855,105 @@ function visualizeTimeArcs(packets) {
 
     const svgContainer = d3.select("#chart").append("svg")
         .attr("width", width + margin.left + margin.right)
-        // Add bottomOverlayHeight so IP rows extend under the bottom legends overlay
-        .attr("height", height + margin.top + margin.bottom + bottomOverlayHeight);
+        .attr("height", height + margin.top + margin.bottom);
 
     svg = svgContainer.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+    // Initialize zoom, clip, and rendering layers
+    // Defer zoom initialization until after zoomed() is defined
+
+    svg.append('defs').append('clipPath').attr('id', 'clip').append('rect')
+        .attr('x', 0)
+        .attr('y', -DOT_RADIUS)
+        .attr('width', width + DOT_RADIUS)
+        .attr('height', height + (2 * DOT_RADIUS));
+
+    mainGroup = svg.append('g').attr('clip-path', 'url(#clip)');
+    fullDomainLayer = mainGroup.append('g').attr('class', 'dots-full-domain');
+    dynamicLayer = mainGroup.append('g').attr('class', 'dots-dynamic');
+
+    // zoom will be initialized after zoomed() is declared below
+
+    // Initialize bottom overlay axis + legends container
+    try {
+        chartMarginLeft = margin.left; chartMarginRight = margin.right;
+        bottomOverlaySvg = d3.select('#chart-bottom-overlay-svg');
+        bottomOverlayWidth = Math.max(0, width + chartMarginLeft + chartMarginRight);
+        bottomOverlaySvg.attr('width', bottomOverlayWidth).attr('height', bottomOverlayHeight);
+        bottomOverlayRoot = bottomOverlaySvg.select('g.overlay-root');
+        if (bottomOverlayRoot.empty()) bottomOverlayRoot = bottomOverlaySvg.append('g').attr('class', 'overlay-root');
+        bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
+        const axisY = Math.max(20, bottomOverlayHeight - 20);
+        bottomOverlaySvg.select('.main-bottom-axis').remove();
+        bottomOverlayAxisGroup = bottomOverlayRoot.append('g')
+            .attr('class', 'x-axis axis main-bottom-axis')
+            .attr('transform', `translate(0,${axisY})`)
+            .call(d3.axisBottom(xScale).tickFormat(d => {
+                const timestampInt = Math.floor(d);
+                const date = new Date(timestampInt / 1000);
+                return date.toISOString().split('T')[1].split('.')[0];
+            }));
+        bottomOverlaySvg.select('.overlay-duration-label').remove();
+        bottomOverlayDurationLabel = bottomOverlayRoot.append('text')
+            .attr('class', 'overlay-duration-label')
+            .attr('x', width / 2)
+            .attr('y', axisY - 12)
+            .attr('text-anchor', 'middle')
+            .style('font-size', '36px')
+            .style('font-weight', '600')
+            .style('fill', '#000')
+            .style('opacity', 0.12)
+            .text('');
+
+    } catch (e) { LOG('Overlay init failed', e); }
+
+    // Duration formatting helper function
+    function formatDuration(us) {
+        const s = us / 1_000_000;
+        if (s < 0.001) return `${(s * 1000 * 1000).toFixed(0)} μs`;
+        if (s < 1) return `${(s * 1000).toFixed(0)} ms`;
+        if (s < 60) return `${s.toFixed(3)} s`;
+        const m = Math.floor(s / 60);
+        const rem = s - m * 60;
+        return `${m}m ${rem.toFixed(3)}s`;
+    }
+
+    // Update zoom duration label function
+    function updateZoomDurationLabel() {
+        if (!bottomOverlayDurationLabel || !xScale) return;
+        try {
+            const domain = xScale.domain();
+            const durUs = Math.max(0, Math.floor(domain[1]) - Math.floor(domain[0]));
+            const label = formatDuration(durUs);
+            const center = xScale((domain[0] + domain[1]) / 2);
+            bottomOverlayDurationLabel.attr('x', center).text(label);
+        } catch (e) { /* ignore */ }
+    }
+
+    // Initial label render
+    try { updateZoomDurationLabel(); } catch(_) {}
+
+    // Build IP row labels on the left gutter
+    try {
+        const node = svg.selectAll('.node')
+            .data(yDomain)
+            .enter()
+            .append('g')
+            .attr('class', 'node')
+            .attr('transform', d => `translate(0,${ipPositions.get(d)})`);
+        node.append('text')
+            .attr('class', 'node-label')
+            .attr('x', -10)
+            .attr('dy', '.35em')
+            .attr('text-anchor', 'end')
+            .text(d => d)
+            .on('mouseover', (e, d) => { try { highlight({ ip: d }); } catch(_) {} })
+            .on('mouseout', () => { try { highlight(null); } catch(_) {} });
+    } catch (e) { LOG('Failed to build IP labels', e); }
+
+    // Make overview read current domain
+    try { window.__arc_x_domain__ = xScale.domain(); } catch {}
+    createOverviewChart(packets, { timeExtent, width });
 
     LOG('SVG setup:', {
         containerWidth: width + margin.left + margin.right,
@@ -2637,6 +2972,7 @@ function visualizeTimeArcs(packets) {
         return date.toISOString().split('T')[1].split('.')[0];
     });
 
+    // Now that scaffolding is ready, define the zoom handler and then initialize zoom
     let zoomTimeout;
     let handshakeTimeout;
     const zoomed = ({ transform, sourceEvent }) => {
@@ -2740,244 +3076,7 @@ function visualizeTimeArcs(packets) {
             }
             try { updateZoomDurationLabel(); } catch(_) {}
             let rScale = d3.scaleSqrt().domain([1, Math.max(1, globalMaxBinCount)]).range([RADIUS_MIN, RADIUS_MAX]);
-            const tooltip = d3.select('#tooltip');
-            dotsSelection = dynamicLayer.selectAll(".direction-dot")
-                .data(binnedPackets, d => d.binned ? `bin_${d.timestamp}_${d.yPos}_${d.flagType}` : `${d.src_ip}-${d.dst_ip}-${d.timestamp}`)
-                .join(
-                    enter => enter.append("circle")
-                        .attr("class", d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                        .attr("r", d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                        .attr("data-orig-r", d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                        .attr("fill", d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                        .attr("cx", d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                        .attr("cy", d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-                        .style("cursor", "pointer")
-                        .on("mouseover", (event, d) => {
-                            const dot = d3.select(event.currentTarget);
-                            dot.classed("highlighted", true).style("stroke", "#000").style("stroke-width", "2px");
-                            const baseR = +dot.attr("data-orig-r") || +dot.attr("r") || RADIUS_MIN;
-                            dot.attr("r", baseR);
-                            const packet = d.originalPackets ? d.originalPackets[0] : d;
-                            const arcPath = arcPathGenerator(packet);
-                            if (arcPath) {
-                                mainGroup.append("path").attr("class", "hover-arc").attr("d", arcPath)
-                                    .style("stroke", flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                                    .style("stroke-width", "2px").style("stroke-opacity", 0.8).style("fill", "none").style("pointer-events", "none");
-                            }
-                            tooltip.style("display", "block").html(createTooltipHTML(d));
-                        })
-                        .on("mousemove", e => { tooltip.style("left", `${e.pageX + 40}px`).style("top", `${e.pageY - 40}px`); })
-                        .on("mouseout", e => {
-                            const dot = d3.select(e.currentTarget);
-                            dot.classed("highlighted", false).style("stroke", null).style("stroke-width", null);
-                            const baseR = +dot.attr("data-orig-r") || RADIUS_MIN; dot.attr("r", baseR);
-                            mainGroup.selectAll(".hover-arc").remove(); tooltip.style("display", "none");
-                        })
-                        .on('click', (event, d) => {
-                            if (!timeExtent) return;
-                            const center = (d.binned && Number.isFinite(d.binCenter)) ? Math.floor(d.binCenter) : (d.binned && Number.isFinite(d.binTimestamp)) ? Math.floor(d.binTimestamp) : Math.floor(d.timestamp);
-                            const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
-                            const timePerPixel = totalRange / Math.max(1, width);
-                            const minPaddingUs = 20000; const paddingFromPixels = Math.ceil(1 * timePerPixel);
-                            const padding = Math.max(minPaddingUs, paddingFromPixels);
-                            let a = Math.max(timeExtent[0], Math.floor(center - padding));
-                            let b = Math.min(timeExtent[1], Math.ceil(center + padding));
-                            if (b <= a) b = Math.min(timeExtent[1], a + 1);
-                            applyZoomDomain([a, b], 'flow'); if (typeof updateBrushFromZoom === 'function') { try { window.__arc_x_domain__ = xScale.domain(); updateBrushFromZoom(); } catch (_) {} }
-                        }),
-                    update => update
-                        .attr("class", d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                        .attr("r", d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                        .attr("data-orig-r", d => d.binned && d.count > 1 ? rScale(d.count) : RADIUS_MIN)
-                        .attr("fill", d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                        .attr("cx", d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                        .attr("cy", d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-                        .style("cursor", "pointer")
-                        .on("mouseover", (event, d) => {
-                            const dot = d3.select(event.currentTarget);
-                            dot.classed("highlighted", true).style("stroke", "#000").style("stroke-width", "2px");
-                            const baseR = +dot.attr("data-orig-r") || +dot.attr("r") || RADIUS_MIN;
-                            dot.attr("r", baseR);
-                            const packet = d.originalPackets ? d.originalPackets[0] : d;
-                            const arcPath = arcPathGenerator(packet);
-                            if (arcPath) {
-                                mainGroup.append("path").attr("class", "hover-arc").attr("d", arcPath)
-                                    .style("stroke", flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                                    .style("stroke-width", "2px").style("stroke-opacity", 0.8).style("fill", "none").style("pointer-events", "none");
-                            }
-                            tooltip.style("display", "block").html(createTooltipHTML(d));
-                        })
-                        .on("mousemove", e => { tooltip.style("left", `${e.pageX + 40}px`).style("top", `${e.pageY - 40}px`); })
-                        .on("mouseout", e => {
-                            const dot = d3.select(e.currentTarget);
-                            dot.classed("highlighted", false).style("stroke", null).style("stroke-width", null);
-                            const baseR = +dot.attr("data-orig-r") || 3; dot.attr("r", baseR);
-                            mainGroup.selectAll(".hover-arc").remove(); tooltip.style("display", "none");
-                        })
-                        .on('click', (event, d) => {
-                            if (!timeExtent) return;
-                            const center = (d.binned && Number.isFinite(d.binCenter)) ? Math.floor(d.binCenter) : (d.binned && Number.isFinite(d.binTimestamp)) ? Math.floor(d.binTimestamp) : Math.floor(d.timestamp);
-                            const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
-                            const timePerPixel = totalRange / Math.max(1, width);
-                            const minPaddingUs = 20000; const paddingFromPixels = Math.ceil(1 * timePerPixel);
-                            const padding = Math.max(minPaddingUs, paddingFromPixels);
-                            let a = Math.max(timeExtent[0], Math.floor(center - padding));
-                            let b = Math.min(timeExtent[1], Math.ceil(center + padding));
-                            if (b <= a) b = Math.min(timeExtent[1], a + 1);
-                            applyZoomDomain([a, b], 'flow'); if (typeof updateBrushFromZoom === 'function') { try { window.__arc_x_domain__ = xScale.domain(); updateBrushFromZoom(); } catch (_) {} }
-                        })
-                );
-
-        }, 32);
-    };
-
-    // Configure zoom so regular mouse-wheel scroll passes through to the page.
-    // Require Ctrl/Cmd/Shift for wheel-zoom to avoid interfering with vertical scrolling
-    zoom = d3.zoom()
-        .filter((event) => {
-            if (!event) return true;
-            if (event.type === 'wheel') {
-                return event.ctrlKey || event.metaKey || event.shiftKey;
-            }
-            return true; // keep drag/pinch and dblclick zoom enabled
-        })
-        .scaleExtent([1, 1e9])
-        .on("zoom", zoomed);
-
-    // Clip the drawing area so large bins do not overlap the left label gutter.
-    // Allow slight overflow on the right and vertically for aesthetics, but not to the left.
-    svg.append("defs").append("clipPath").attr("id", "clip").append("rect")
-        .attr("x", 0)
-        .attr("y", -DOT_RADIUS)
-        .attr("width", width + DOT_RADIUS) // only extend to the right, not into label gutter
-        .attr("height", height + (2 * DOT_RADIUS));
-
-    mainGroup = svg.append("g").attr("clip-path", "url(#clip)");
-    fullDomainLayer = mainGroup.append("g").attr("class", "dots-full-domain");
-    dynamicLayer = mainGroup.append("g").attr("class", "dots-dynamic");
-
-    zoomTarget = svgContainer;
-    zoomTarget.call(zoom);
-
-    // Publish current domain so overview can read it for initial sync
-    try { window.__arc_x_domain__ = xScale.domain(); } catch {}
-    createOverviewChart(packets, { timeExtent, width });
-
-    const tcpFlowGroup = mainGroup.append("g").attr("class", "tcp-flow-lines");
-    try {
-        tcpFlowGroup.lower();
-        if (fullDomainLayer) fullDomainLayer.raise();
-        if (dynamicLayer) dynamicLayer.raise();
-    } catch {}
-
-    // --- Bottom overlay setup for fixed main axis + legends ---
-    try {
-        chartMarginLeft = margin.left; chartMarginRight = margin.right;
-        bottomOverlaySvg = d3.select('#chart-bottom-overlay-svg');
-        bottomOverlayWidth = Math.max(0, width + chartMarginLeft + chartMarginRight);
-        bottomOverlaySvg
-            .attr('width', bottomOverlayWidth)
-            .attr('height', bottomOverlayHeight);
-        // Root translated by left margin to align with main plot area
-        bottomOverlayRoot = bottomOverlaySvg.select('g.overlay-root');
-        if (bottomOverlayRoot.empty()) {
-            bottomOverlayRoot = bottomOverlaySvg.append('g').attr('class', 'overlay-root');
-        }
-        bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
-        // Axis group anchored near bottom of overlay
-        const axisY = Math.max(20, bottomOverlayHeight - 20);
-        bottomOverlaySvg.select('.main-bottom-axis').remove();
-        bottomOverlayAxisGroup = bottomOverlayRoot.append('g')
-            .attr('class', 'x-axis axis main-bottom-axis')
-            .attr('transform', `translate(0,${axisY})`)
-            .call(xAxis);
-        // Create duration label in overlay, just above axis
-        bottomOverlaySvg.select('.overlay-duration-label').remove();
-        bottomOverlayDurationLabel = bottomOverlayRoot.append('text')
-            .attr('class', 'overlay-duration-label')
-            .attr('x', width / 2)
-            .attr('y', axisY - 12)
-            .attr('text-anchor', 'middle')
-            .style('font-size', '36px')
-            .style('font-weight', '600')
-            .style('fill', '#000')
-            .style('opacity', 0.5)
-            .style('pointer-events', 'none')
-            .text('');
-    } catch (_) {}
-
-    // Duration label is in bottom overlay now
-
-    function formatDuration(us) {
-        const s = us / 1_000_000;
-        if (s < 0.001) return `${(s * 1000 * 1000).toFixed(0)} μs`;
-        if (s < 1) return `${(s * 1000).toFixed(0)} ms`;
-        if (s < 60) return `${s.toFixed(3)} s`;
-        const m = Math.floor(s / 60);
-        const rem = s - m * 60;
-        return `${m}m ${rem.toFixed(3)}s`;
-    }
-
-    function updateZoomDurationLabel() {
-        if (!bottomOverlayDurationLabel || !xScale) return;
-        try {
-            const domain = xScale.domain();
-            const durUs = Math.max(0, Math.floor(domain[1]) - Math.floor(domain[0]));
-            const label = formatDuration(durUs);
-            const center = xScale((domain[0] + domain[1]) / 2);
-            bottomOverlayDurationLabel.attr('x', center).text(label);
-        } catch (e) { /* ignore */ }
-    }
-
-    // Initial label render
-    updateZoomDurationLabel();
-
-    const tooltip = d3.select("#tooltip");
-
-    const node = svg.selectAll(".node").data(yDomain).enter().append("g")
-        .attr("class", "node")
-        .attr("transform", d => `translate(0,${ipPositions.get(d)})`);
-    node.append("text").attr("class", "node-label").attr("x", -10).attr("dy", ".35em").attr("text-anchor", "end")
-        .text(d => d)
-        .on("mouseover", (e, d) => { highlight({ip: d}); })
-        .on("mouseout", () => highlight(null));
-
-    // Enable drag-to-reorder for IP rows
-    const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
-    const dragBehavior = d3.drag()
-        .on('start', function (event, ip) {
-            d3.select(this).raise();
-            d3.select(this).style('cursor', 'grabbing');
-        })
-        .on('drag', function (event, ip) {
-            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
-            const y = clamp(event.y, TOP_PAD, maxY);
-            d3.select(this).attr('transform', `translate(0,${y})`);
-        })
-        .on('end', function (event, ip) {
-            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
-            const y = clamp(event.y, TOP_PAD, maxY);
-            // Compute target index based on drop position
-            let targetIdx = Math.round((y - TOP_PAD) / ROW_GAP);
-            targetIdx = Math.max(0, Math.min(ipOrder.length - 1, targetIdx));
-
-            const fromIdx = ipOrder.indexOf(ip);
-            if (fromIdx === -1) return;
-            if (fromIdx !== targetIdx) {
-                // Reorder ipOrder
-                ipOrder.splice(fromIdx, 1);
-                ipOrder.splice(targetIdx, 0, ip);
-                // Rebuild ipPositions mapping
-                ipOrder.forEach((p, i) => ipPositions.set(p, TOP_PAD + i * ROW_GAP));
-            }
-
-            // Animate all node groups to their new positions
-            svg.selectAll('.node')
-                .transition().duration(150)
-                .attr('transform', d => `translate(0,${ipPositions.get(d)})`)
-                .on('end', function () {
-                    d3.select(this).style('cursor', null);
-                });
+            renderMarksForLayer(dynamicLayer, binnedPackets, rScale);
 
             // Clear cached bins so re-render uses new y positions
             try { fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false }; } catch(_) {}
@@ -2989,6 +3088,71 @@ function visualizeTimeArcs(packets) {
             try {
                 const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value);
                 drawGroundTruthBoxes(selectedIPs);
+            } catch(_) {}
+            try { updateZoomDurationLabel(); } catch(_) {}
+        });
+    };
+
+    // Initialize zoom now that zoomed() exists
+    zoom = d3.zoom()
+        .filter((event) => {
+            if (!event) return true;
+            if (event.type === 'wheel') return event.ctrlKey || event.metaKey || event.shiftKey;
+            return true;
+        })
+        .scaleExtent([1, 1e9])
+        .on('zoom', zoomed);
+    zoomTarget = svgContainer;
+    zoomTarget.call(zoom);
+
+    // Enable drag-to-reorder for IP rows (ported from arc diagram implementation)
+    // This restores the ability to vertically reorder IP rows by dragging their labels.
+    const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+    const dragBehavior = d3.drag()
+        .on('start', function (event, ip) {
+            try { d3.select(this).raise(); } catch(_) {}
+            d3.select(this).style('cursor', 'grabbing');
+        })
+        .on('drag', function (event, ip) {
+            // event.y is relative to the group this drag is applied in (the margin-translated svg group)
+            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
+            const y = clamp(event.y, TOP_PAD, maxY);
+            d3.select(this).attr('transform', `translate(0,${y})`);
+        })
+        .on('end', function (event, ip) {
+            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
+            const y = clamp(event.y, TOP_PAD, maxY);
+            let targetIdx = Math.round((y - TOP_PAD) / ROW_GAP);
+            targetIdx = Math.max(0, Math.min(ipOrder.length - 1, targetIdx));
+
+            const fromIdx = ipOrder.indexOf(ip);
+            if (fromIdx === -1) return;
+            if (fromIdx !== targetIdx) {
+                // Reorder ipOrder array
+                ipOrder.splice(fromIdx, 1);
+                ipOrder.splice(targetIdx, 0, ip);
+                // Rebuild y position lookup
+                ipOrder.forEach((p, i) => ipPositions.set(p, TOP_PAD + i * ROW_GAP));
+            }
+
+            // Animate row labels into their new slots
+            svg.selectAll('.node')
+                .transition().duration(150)
+                .attr('transform', d => `translate(0,${ipPositions.get(d)})`)
+                .on('end', function () { d3.select(this).style('cursor', 'grab'); });
+
+            // Invalidate cached full-domain bins so subsequent renders recompute with updated y positions
+            try { fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false }; } catch(_) {}
+            // Force a lightweight re-render at current zoom domain (will trigger zoom handler logic)
+            try { isHardResetInProgress = true; applyZoomDomain(xScale.domain(), 'program'); } catch(_) {}
+
+            // Redraw flow arcs & ground truth overlays with new vertical positions
+            try { drawSelectedFlowArcs(); } catch(_) {}
+            try {
+                if (showGroundTruth) {
+                    const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value);
+                    drawGroundTruthBoxes(selectedIPs);
+                }
             } catch(_) {}
             try { updateZoomDurationLabel(); } catch(_) {}
         });
@@ -3025,90 +3189,7 @@ function visualizeTimeArcs(packets) {
     });
     fullDomainBinsCache.sorted = true;
 
-    dotsSelection = fullDomainLayer.selectAll(".direction-dot")
-        .data(initialBinnedPackets, d => d.binned ? `bin_${d.timestamp}_${d.yPos}_${d.flagType}` : `${d.src_ip}-${d.dst_ip}-${d.timestamp}`)
-        .join(
-            enter => enter.append("circle")
-                .attr("class", d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                .attr("r", d => d.binned && d.count > 1 ? initialRScale(d.count) : RADIUS_MIN)
-                .attr("data-orig-r", d => d.binned && d.count > 1 ? initialRScale(d.count) : RADIUS_MIN)
-                .attr("fill", d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                .attr("cx", d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                .attr("cy", d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-                .style("cursor", "pointer")
-                .style("stroke", _ => "none")
-                .style("stroke-width", _ => "0px")
-                .on("mouseover", (event, d) => {
-                    const dot = d3.select(event.currentTarget);
-                    dot.classed("highlighted", true).style("stroke", "#000").style("stroke-width", "2px");
-                    const baseR = +dot.attr("data-orig-r") || +dot.attr("r") || RADIUS_MIN;
-                    dot.attr("r", baseR);
-                    const packet = d.originalPackets ? d.originalPackets[0] : d;
-                    const arcPath = arcPathGenerator(packet);
-                    if (arcPath) {
-                        mainGroup.append("path")
-                            .attr("class", "hover-arc")
-                            .attr("d", arcPath)
-                            .style("stroke", flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                            .style("stroke-width", "2px")
-                            .style("stroke-opacity", 0.8)
-                            .style("fill", "none")
-                            .style("pointer-events", "none");
-                    }
-                    tooltip.style("display", "block").html(createTooltipHTML(d));
-                })
-                .on("mousemove", e => { tooltip.style("left", `${e.pageX + 40}px`).style("top", `${e.pageY - 40}px`); })
-                .on("mouseout", e => {
-                    const dot = d3.select(e.currentTarget);
-                    dot.classed("highlighted", false)
-                       .style("stroke", null)
-                       .style("stroke-width", null);
-                    const baseR = +dot.attr("data-orig-r") || RADIUS_MIN;
-                    dot.attr("r", baseR);
-                    mainGroup.selectAll(".hover-arc").remove();
-                    tooltip.style("display", "none");
-                }),
-            update => update
-                .attr("class", d => `direction-dot ${d.binned && d.count > 1 ? 'binned' : ''}`)
-                .attr("r", d => d.binned && d.count > 1 ? initialRScale(d.count) : RADIUS_MIN)
-                .attr("data-orig-r", d => d.binned && d.count > 1 ? initialRScale(d.count) : RADIUS_MIN)
-                .attr("fill", d => flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                .attr("cx", d => xScale(Math.floor(d.binned && Number.isFinite(d.binCenter) ? d.binCenter : d.timestamp)))
-                .attr("cy", d => d.binned ? d.yPos : findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions))
-                .style("cursor", "pointer")
-                .on("mouseover", (event, d) => {
-                    const dot = d3.select(event.currentTarget);
-                    dot.classed("highlighted", true)
-                       .style("stroke", "#000")
-                       .style("stroke-width", "2px");
-                    const baseR = +dot.attr("data-orig-r") || +dot.attr("r") || RADIUS_MIN;
-                    dot.attr("r", baseR);
-                    const packet = d.originalPackets ? d.originalPackets[0] : d;
-                    const arcPath = arcPathGenerator(packet);
-                    if (arcPath) {
-                        mainGroup.append("path")
-                            .attr("class", "hover-arc")
-                            .attr("d", arcPath)
-                            .style("stroke", flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                            .style("stroke-width", "2px")
-                            .style("stroke-opacity", 0.8)
-                            .style("fill", "none")
-                            .style("pointer-events", "none");
-                    }
-                    tooltip.style("display", "block").html(createTooltipHTML(d));
-                })
-                .on("mousemove", e => { tooltip.style("left", `${e.pageX + 40}px`).style("top", `${e.pageY - 40}px`); })
-                .on("mouseout", e => {
-                    const dot = d3.select(e.currentTarget);
-                    dot.classed("highlighted", false)
-                       .style("stroke", null)
-                       .style("stroke-width", null);
-                    const baseR = +dot.attr("data-orig-r") || RADIUS_MIN; dot.attr("r", baseR);
-                    mainGroup.selectAll(".hover-arc").remove();
-                    tooltip.style("display", "none");
-                }),
-            exit => exit.remove()
-        );
+    renderMarksForLayer(fullDomainLayer, initialBinnedPackets, initialRScale);
 
     if (fullDomainLayer) fullDomainLayer.style("display", null);
     if (dynamicLayer) dynamicLayer.style("display", "none");
@@ -3227,7 +3308,7 @@ window.testResize = function() {
 
 // Cleanup function to remove event listeners and clear state
 function cleanup() {
-    console.log('Cleaning up arc visualization...');
+    console.log('Cleaning up bar visualization...');
     
     // Clear timeouts and intervals
     if (typeof resizeTimeout !== 'undefined') {
@@ -3278,7 +3359,7 @@ function cleanup() {
 
 // Initialize the module
 function init() {
-    console.log('Initializing arc visualization...');
+    console.log('Initializing bar visualization...');
     
     // Add file input listener
     const dataFileInput = document.getElementById('dataFile');
@@ -3287,7 +3368,7 @@ function init() {
     }
     
     // Initialize the visualization
-    initializeArcVisualization();
+    initializeBarVisualization();
     
     // Load ground truth data in the background
     loadGroundTruthData();
