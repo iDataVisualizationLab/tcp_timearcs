@@ -1572,8 +1572,8 @@ function drawGroundTruthBoxes(selectedIPs) {
             // Same timestamp - expand to cover full second
             // Start at the beginning of the second (.000000)
             adjustedStartMicroseconds = Math.floor(event.startTimeMicroseconds / 1000000) * 1000000;
-            // End at the end of the second (.999999)
-            adjustedStopMicroseconds = adjustedStartMicroseconds + 999999;
+            // End at the end of the 59th second (i.e., 59 seconds after start)
+            adjustedStopMicroseconds = adjustedStartMicroseconds + 59 * 1_000_000;
         }
         
         const startX = xScale(adjustedStartMicroseconds);

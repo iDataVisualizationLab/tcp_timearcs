@@ -60,6 +60,19 @@ def classify_tcp_flags(flag_val):
     
     return "NONE" if flag_val == 0 else f"OTHER_{flag_val}"
 
+def _safe_int(val, default=0):
+    """Safely convert to int, handling NaN/None/empty."""
+    try:
+        import pandas as _pd
+        if _pd.isna(val):
+            return default
+    except Exception:
+        pass
+    try:
+        return int(val)
+    except Exception:
+        return default
+
 def _is_set(flags: int, mask: int) -> bool:
     try:
         return (int(flags) & mask) != 0
@@ -369,7 +382,19 @@ def detect_tcp_flows(records, selected_ips=None):
                 flow['closeType'] = 'invalid'
         elif flow['state'] == 'closing':
             flow['state'] = 'closed'
-        
+
+        # Mark ongoing flows explicitly (non-invalid, not gracefully/abortively closed)
+        # Ongoing = reached establishment or data, no RST/FIN completion observed
+        if (
+            flow['state'] not in ('invalid', 'closed', 'aborted')
+            and not flow.get('closeType')  # no graceful/abortive/invalid close type
+            and (flow.get('establishmentComplete') or flow.get('dataTransferStarted'))
+        ):
+            flow['state'] = 'ongoing'
+            flow['ongoing'] = True
+            # Label close type as 'open' for downstream consumers; UI maps non-graceful/abortive to Unknown
+            flow['closeType'] = 'open'
+
         # HTML adds ALL flows, no filtering (line 3850: flows.push(flow))
         flows.append(flow)
     
@@ -400,10 +425,8 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
         df = df.head(max_records)
         print(f"Limited to {max_records} records")
     
-    # Filter for TCP protocol only
-    if 'protocol' in df.columns:
-        df = df[df['protocol'] == 6]  # TCP protocol number
-        print(f"Filtered to {len(df)} TCP records")
+    # Do NOT filter non-TCP rows here. Keep all records in output.
+    # We'll ignore non-TCP when detecting TCP flows.
     
     # Convert integer IPs to dotted notation if needed
     if 'src_ip' in df.columns:
@@ -430,21 +453,31 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
     if missing_cols:
         print(f"Warning: Missing required columns: {missing_cols}", file=sys.stderr)
     
-    # Convert to list of dictionaries
+    # Convert to list of dictionaries (keep all protocols)
     records = []
     for _, row in df.iterrows():
+        # Resolve protocol as int when available, else empty string
+        proto_raw = row.get('protocol') if 'protocol' in df.columns else None
+        try:
+            if proto_raw is not None and not pd.isna(proto_raw):
+                protocol_val = int(proto_raw)
+            else:
+                protocol_val = ''
+        except Exception:
+            protocol_val = ''
+
         record = {
-            'timestamp': int(row.get('timestamp', 0)),
+            'timestamp': _safe_int(row.get('timestamp', 0), 0),
             'src_ip': str(row.get('src_ip', '')),
             'dst_ip': str(row.get('dst_ip', '')),
-            'src_port': int(row.get('src_port', 0)),
-            'dst_port': int(row.get('dst_port', 0)),
-            'flags': int(row.get('flags', 0)),
+            'src_port': _safe_int(row.get('src_port', 0), 0),
+            'dst_port': _safe_int(row.get('dst_port', 0), 0),
+            'flags': _safe_int(row.get('flags', 0), 0),
             'flag_type': row.get('flag_type', 'UNKNOWN'),
-            'seq_num': int(row.get('seq_num', 0)),
-            'ack_num': int(row.get('ack_num', 0)),
-            'length': int(row.get('length', 0)),
-            'protocol': 'TCP'
+            'seq_num': _safe_int(row.get('seq_num', 0), 0),
+            'ack_num': _safe_int(row.get('ack_num', 0), 0),
+            'length': _safe_int(row.get('length', 0), 0),
+            'protocol': protocol_val
         }
         records.append(record)
     
@@ -454,8 +487,10 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
     )))
 
     # Pre-compute flows and aggregates for ALL records (no IP filtering in Python)
-    print("Detecting TCP flows and computing aggregates...")
-    flows, ip_pairs, ip_stats, flag_stats = detect_tcp_flows(records, selected_ips=None)
+    print("Detecting TCP flows and computing aggregates (ignoring non-TCP packets)...")
+    # Only TCP packets (protocol == 6) are considered for flow detection/statistics
+    tcp_records = [r for r in records if r.get('protocol') == 6 or str(r.get('protocol')).upper() == 'TCP']
+    flows, ip_pairs, ip_stats, flag_stats = detect_tcp_flows(tcp_records, selected_ips=None)
     
     # Create a comprehensive single CSV with all data
     print(f"Saving all processed data to {output_file}...")
@@ -481,7 +516,8 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
                 'flow_invalid_reason': flow.get('invalidReason', ''),
                 'establishment_packets': len(flow['phases']['establishment']),
                 'data_transfer_packets': len(flow['phases']['dataTransfer']),
-                'closing_packets': len(flow['phases']['closing'])
+                'closing_packets': len(flow['phases']['closing']),
+                'flow_ongoing': flow.get('ongoing', False)
             }
     
     # Enhanced packet records with flow information
@@ -528,6 +564,7 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
             'establishment_packets': flow_info.get('establishment_packets', 0),
             'data_transfer_packets': flow_info.get('data_transfer_packets', 0),
             'closing_packets': flow_info.get('closing_packets', 0),
+            'flow_ongoing': flow_info.get('flow_ongoing', False),
             
             # Source IP statistics
             'src_sent_packets': src_stats.get('sent_packets', 0),
