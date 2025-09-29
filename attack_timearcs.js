@@ -197,16 +197,17 @@
     // Clear
     svg.selectAll('*').remove();
 
-    // Axes — use UTC formatting to stay consistent with tooltip
+    // Axes — render to sticky top SVG instead of scrolling chart SVG
     const utcTick = d3.utcFormat('%Y-%m-%d %H:%M');
     const xAxis = d3.axisTop(x).ticks(looksAbsolute ? 7 : 7).tickFormat(d => {
       if (looksAbsolute) return utcTick(d);
       const mins = Math.round((d.getTime()) / 60000);
       return `t=${mins}m`;
     });
-    svg.append('g')
-      .attr('class', 'time-axis')
-      .attr('transform', `translate(0, ${margin.top - 8})`)
+    const axisSvg = d3.select('#axis-top').attr('width', width).attr('height', 36);
+    axisSvg.selectAll('*').remove();
+    axisSvg.append('g')
+      .attr('transform', 'translate(0,28)')
       .call(xAxis);
 
     // Row labels and span lines: draw per-IP line only from first to last activity
