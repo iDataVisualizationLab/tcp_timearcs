@@ -35,11 +35,18 @@
   let colorByAttack = null; // Map<string, string> by canonicalized name
   let rawColorByAttack = null; // original keys
 
-  // Try to load ip_map.json and build reverse map
-  loadIpMap();
-  // Load event type and color mappings
-  loadEventTypeMap();
-  loadColorMapping();
+  // Initialize mappings, then try a default CSV load
+  (async function init() {
+    try {
+      await Promise.all([
+        loadIpMap(),
+        loadEventTypeMap(),
+        loadColorMapping(),
+      ]);
+    } catch (_) { /* non-fatal */ }
+    // After maps are ready (or failed gracefully), try default CSV
+    tryLoadDefaultCsv();
+  })();
 
   // Handle CSV upload
   fileInput?.addEventListener('change', async (e) => {
@@ -75,6 +82,35 @@
       clearChart();
     }
   });
+
+  async function tryLoadDefaultCsv() {
+    const defaultPath = './90min_day1_attacks.csv';
+    try {
+      const res = await fetch(defaultPath, { cache: 'no-store' });
+      if (!res.ok) return; // quietly exit if not found
+      const text = await res.text();
+      const rows = d3.csvParse((text || '').trim());
+      const data = rows.map((d, i) => {
+        const attackName = decodeAttack(d.attack);
+        return {
+          idx: i,
+          timestamp: toNumber(d.timestamp),
+          length: toNumber(d.length),
+          src_ip: decodeIp(d.src_ip),
+          dst_ip: decodeIp(d.dst_ip),
+          protocol: (d.protocol || '').toUpperCase() || 'OTHER',
+          count: toNumber(d.count) || 1,
+          attack: attackName,
+        };
+      }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
+
+      if (!data.length) return;
+      status(`Loaded default: 90min_day1_attacks.csv (${data.length} rows)`);
+      render(data);
+    } catch (err) {
+      // ignore if file isn't present; keep waiting for upload
+    }
+  }
 
   function toNumber(v) {
     const n = +v; return isFinite(n) ? n : 0;
