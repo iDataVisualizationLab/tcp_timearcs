@@ -287,6 +287,20 @@
           .attr('font-weight', s => active.has(s) ? 'bold' : null)
           .attr('fill', s => active.has(s) ? '#2563eb' : '#343a40');
 
+        // Draw a dot at the source node to indicate direction
+        const xpDot = x(toDate(d.minute));
+        const ySource = y(d.source);
+        svg.selectAll('.direction-dot').remove();
+        svg.append('circle')
+          .attr('class', 'direction-dot')
+          .attr('cx', xpDot)
+          .attr('cy', ySource)
+          .attr('r', 3.2)
+          .attr('fill', colorForAttack(d.attack || 'normal'))
+          .attr('stroke', '#000')
+          .attr('stroke-width', 0.6)
+          .style('pointer-events', 'none');
+
         // Move the two endpoint labels close to the hovered link's time
         const xp = x(toDate(d.minute));
         svg.selectAll('.ip-label')
@@ -323,6 +337,7 @@
           .transition()
           .duration(200)
           .attr('x', margin.left - 8);
+        svg.selectAll('.direction-dot').remove();
       });
 
     status(`${data.length} records • ${ips.length} IPs • ${attacks.length} attack types`);
@@ -429,16 +444,16 @@
     return res;
   }
 
-  // Compute links: aggregate per (source, target, minute), sum counts, pick dominant attack label
+  // Compute links: aggregate per (src_ip -> dst_ip, minute), sum counts, pick dominant attack label
   function computeLinks(data) {
-    const keyOf = (a, b, m) => (a < b ? `${a}__${b}__${m}` : `${b}__${a}__${m}`);
+    const keyOf = (src, dst, m) => `${src}__${dst}__${m}`; // keep direction
     const agg = new Map(); // key -> {source, target, minute, count, attackCounts}
     for (const row of data) {
-      const a = row.src_ip, b = row.dst_ip, m = row.timestamp;
-      const k = keyOf(a, b, m);
+      const src = row.src_ip, dst = row.dst_ip, m = row.timestamp;
+      const k = keyOf(src, dst, m);
       let rec = agg.get(k);
       if (!rec) {
-        rec = { source: a < b ? a : b, target: a < b ? b : a, minute: m, count: 0, attackCounts: new Map() };
+        rec = { source: src, target: dst, minute: m, count: 0, attackCounts: new Map() };
         agg.set(k, rec);
       }
       const c = (row.count || 1);
