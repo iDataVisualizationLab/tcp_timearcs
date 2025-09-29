@@ -274,8 +274,8 @@
         return verticalArcPath(xp, y1, y2);
       })
       .on('mouseover', function (event, d) {
-        // Highlight hovered arc and endpoints; dim others
-        arcPaths.attr('stroke-opacity', p => (p === d ? 1 : 0.05));
+        // Highlight hovered arc at 100% opacity, others at 30% (override CSS with inline style)
+        arcPaths.style('stroke-opacity', p => (p === d ? 1 : 0.3));
         const baseW = widthScale(Math.max(1, d.count));
         d3.select(this).attr('stroke-width', Math.max(3, baseW < 2 ? baseW * 3 : baseW * 1.5)).raise();
 
@@ -313,7 +313,9 @@
       })
       .on('mouseout', function () {
         hideTooltip();
-        arcPaths.attr('stroke-opacity', 0.8).attr('stroke-width', d => widthScale(Math.max(1, d.count)));
+        // Restore default opacity (use style to override CSS)
+        arcPaths.style('stroke-opacity', 0.6)
+                .attr('stroke-width', d => widthScale(Math.max(1, d.count)));
         svg.selectAll('.row-line').attr('stroke-opacity', 1).attr('stroke-width', 0.4);
         svg.selectAll('.ip-label')
           .attr('font-weight', null)
