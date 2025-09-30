@@ -1567,6 +1567,7 @@ function drawGroundTruthBoxes(selectedIPs) {
         // If they're identical, expand to cover the full second (microsecond precision)
         let adjustedStartMicroseconds = event.startTimeMicroseconds;
         let adjustedStopMicroseconds = event.stopTimeMicroseconds;
+        let wasExpanded = false;
         
         if (event.startTimeMicroseconds === event.stopTimeMicroseconds) {
             // Same timestamp - expand to cover full second
@@ -1574,6 +1575,7 @@ function drawGroundTruthBoxes(selectedIPs) {
             adjustedStartMicroseconds = Math.floor(event.startTimeMicroseconds / 1000000) * 1000000;
             // End at the end of the 59th second (i.e., 59 seconds after start)
             adjustedStopMicroseconds = adjustedStartMicroseconds + 59 * 1_000_000;
+            wasExpanded = true;
         }
         
         const startX = xScale(adjustedStartMicroseconds);
@@ -1590,7 +1592,10 @@ function drawGroundTruthBoxes(selectedIPs) {
             width: width,
             height: boxHeight,
             color: eventColors[event.eventType] || '#666',
-            isSource: true
+            isSource: true,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
         });
         
         // Create box for destination IP
@@ -1602,7 +1607,10 @@ function drawGroundTruthBoxes(selectedIPs) {
             width: width,
             height: boxHeight,
             color: eventColors[event.eventType] || '#666',
-            isSource: false
+            isSource: false,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
         });
     });
 
@@ -1616,29 +1624,44 @@ function drawGroundTruthBoxes(selectedIPs) {
         .append('rect')
         .attr('class', 'ground-truth-box')
         .attr('fill', d => d.color)
-        .attr('stroke', d => d.color)
-        .on('mouseover', (event, d) => {
-            // Only show tooltip, do NOT change stacking order
-            const tooltip = d3.select('#tooltip');
-            const tooltipContent = `
-                <b>${d.event.eventType}</b><br>
-                IP: ${d.ip} (${d.isSource ? 'Source' : 'Destination'})<br>
-                From: ${d.event.source}<br>
-                To: ${d.event.destination}<br>
-                Start: ${d.event.startTime}<br>
-                Stop: ${d.event.stopTime}<br>
-                Duration: ${Math.round((d.event.stopTimeMicroseconds - d.event.startTimeMicroseconds) / 1000000)}s
-            `;
-            tooltip.style('display', 'block').html(tooltipContent);
-        })
-        .on('mousemove', e => {
-            d3.select('#tooltip')
-                .style('left', `${e.pageX + 40}px`)
-                .style('top', `${e.pageY - 40}px`);
-        })
-        .on('mouseout', () => {
-            d3.select('#tooltip').style('display', 'none');
-        });
+        .attr('stroke', d => d.color);
+
+    function formatAdjStop(adjStop, wasExpanded) {
+        let s = epochMicrosecondsToUTC(adjStop).replace(' UTC','');
+        if (s.includes('.')) s = s.split('.')[0];
+        if (wasExpanded) s += ' (+59s)';
+        return s;
+    }
+    function showTooltip(event, d) {
+        const tooltip = d3.select('#tooltip');
+        const adjStop = d.adjustedStopMicroseconds || d.event.stopTimeMicroseconds;
+        const adjStart = d.adjustedStartMicroseconds || d.event.startTimeMicroseconds;
+        const durationSec = Math.round((adjStop - adjStart) / 1_000_000);
+        const startStr = d.event.startTime;
+        const expandedStopStr = formatAdjStop(adjStop, false);
+        let tooltipContent = `
+            <b>${d.event.eventType}</b><br>
+            IP: ${d.ip} (${d.isSource ? 'Source' : 'Destination'})<br>
+            From: ${d.event.source}<br>
+            To: ${d.event.destination}<br>
+            Start: ${startStr}<br>
+        `;
+        if (d.wasExpanded) {
+            tooltipContent += `Original Stop: ${d.event.stopTime}<br>`;
+            tooltipContent += `Expanded Stop (+59s): ${expandedStopStr}<br>`;
+            tooltipContent += `Expanded Duration: ${durationSec}s`;
+        } else {
+            tooltipContent += `Stop: ${d.event.stopTime}<br>`;
+            tooltipContent += `Duration: ${durationSec}s`;
+        }
+        tooltip.style('display','block').html(tooltipContent);
+    }
+    function moveTooltip(e) { d3.select('#tooltip').style('left', `${e.pageX + 40}px`).style('top', `${e.pageY - 40}px`); }
+    function hideTooltip() { d3.select('#tooltip').style('display','none'); }
+    groundTruthGroup.selectAll('.ground-truth-box')
+        .on('mouseover', showTooltip)
+        .on('mousemove', moveTooltip)
+        .on('mouseout', hideTooltip);
 
     // Update all boxes (existing and new)
     groundTruthGroup.selectAll('.ground-truth-box')
