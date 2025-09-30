@@ -5,6 +5,8 @@
 
 (function () {
   const fileInput = document.getElementById('fileInput');
+  const eventTypeInput = document.getElementById('eventTypeInput');
+  const ipMapInput = document.getElementById('ipMapInput');
   const statusEl = document.getElementById('status');
   const svg = d3.select('#chart');
   const container = document.getElementById('chart-container');
@@ -56,6 +58,7 @@
     try {
       const text = await file.text();
       const rows = d3.csvParse(text.trim());
+      lastRawCsvRows = rows; // cache raw rows
       const data = rows.map((d, i) => {
         const attackName = decodeAttack(d.attack);
         return {
@@ -83,6 +86,111 @@
     }
   });
 
+  // Allow user to upload a custom event_type_mapping JSON to override default mapping
+  eventTypeInput?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    status(`Loading event type map ${file.name} …`);
+    try {
+      const text = await file.text();
+      const obj = JSON.parse(text);
+      // Expect format name -> id OR id -> name. Detect by sampling a few keys.
+      const entries = Object.entries(obj);
+      const rev = new Map();
+      if (entries.length) {
+        // Heuristic: if value is number, we assume name->id and reverse; else if key is numeric, we assume id->name.
+        let nameToIdMode = 0, idToNameMode = 0;
+        for (const [k, v] of entries.slice(0, 10)) {
+          if (typeof v === 'number') nameToIdMode++;
+          if (!isNaN(+k) && typeof v === 'string') idToNameMode++;
+        }
+        if (nameToIdMode >= idToNameMode) {
+          for (const [name, id] of entries) {
+            const num = Number(id);
+            if (Number.isFinite(num)) rev.set(num, name);
+          }
+        } else {
+          for (const [idStr, name] of entries) {
+            const num = Number(idStr);
+            if (Number.isFinite(num) && typeof name === 'string') rev.set(num, name);
+          }
+        }
+      }
+      attackIdToName = rev;
+      status(`Custom event type map loaded (${rev.size} entries). Re-rendering…`);
+      // If a dataset was already rendered, we need to re-decode attacks and re-render.
+      // Easier: trigger reload of default CSV if present, else wait for user CSV.
+      // We'll look for currently loaded arcs' underlying data isn't stored; keep a cached last CSV rows.
+      if (lastRawCsvRows) {
+        render(rebuildDataFromRawRows(lastRawCsvRows));
+      }
+    } catch (err) {
+      console.error(err);
+      status('Failed to parse event type JSON.');
+    }
+  });
+
+  // Allow user to upload a custom ip_map JSON (expected format: { "1.2.3.4": 123, ... } OR reverse { "123": "1.2.3.4" })
+  ipMapInput?.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    status(`Loading IP map ${file.name} …`);
+    try {
+      const text = await file.text();
+      const obj = JSON.parse(text);
+      const rev = new Map();
+      const entries = Object.entries(obj);
+      // Detect orientation: sample if keys look like IPs
+      let ipKeyMode = 0, numericKeyMode = 0;
+      for (const [k,v] of entries.slice(0,20)) {
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(k) && Number.isFinite(Number(v))) ipKeyMode++;
+        if (!isNaN(+k) && typeof v === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(v)) numericKeyMode++;
+      }
+      if (ipKeyMode >= numericKeyMode) {
+        // ipString -> idNumber
+        for (const [ip,id] of entries) {
+          const num = Number(id);
+            if (Number.isFinite(num) && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) rev.set(num, ip);
+        }
+      } else {
+        // idNumber -> ipString
+        for (const [idStr, ip] of entries) {
+          const num = Number(idStr);
+          if (Number.isFinite(num) && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) rev.set(num, ip);
+        }
+      }
+      ipIdToAddr = rev;
+      ipMapLoaded = true;
+      status(`Custom IP map loaded (${rev.size} entries). Re-rendering…`);
+      if (lastRawCsvRows) {
+        // rebuild to decode IP ids again
+        render(rebuildDataFromRawRows(lastRawCsvRows));
+      }
+    } catch (err) {
+      console.error(err);
+      status('Failed to parse IP map JSON.');
+    }
+  });
+
+  // Keep last raw CSV rows so we can rebuild when mappings change
+  let lastRawCsvRows = null; // array of raw objects from csvParse
+
+  function rebuildDataFromRawRows(rows){
+    return rows.map((d, i) => {
+      const attackName = decodeAttack(d.attack);
+      return {
+        idx: i,
+        timestamp: toNumber(d.timestamp),
+        length: toNumber(d.length),
+        src_ip: decodeIp(d.src_ip),
+        dst_ip: decodeIp(d.dst_ip),
+        protocol: (d.protocol || '').toUpperCase() || 'OTHER',
+        count: toNumber(d.count) || 1,
+        attack: attackName,
+      };
+    }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
+  }
+
   async function tryLoadDefaultCsv() {
     const defaultPath = './90min_day1_attacks.csv';
     try {
@@ -90,6 +198,7 @@
       if (!res.ok) return; // quietly exit if not found
       const text = await res.text();
       const rows = d3.csvParse((text || '').trim());
+      lastRawCsvRows = rows; // cache raw rows
       const data = rows.map((d, i) => {
         const attackName = decodeAttack(d.attack);
         return {
