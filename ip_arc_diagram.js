@@ -2078,12 +2078,57 @@ function formatTimestamp(timestamp) {
 }
 
 function createTooltipHTML(data) {
+    // Helper to decode protocol numbers to names; falls back to TCP for legacy datasets.
+    const PROTOCOL_MAP = {
+        1: 'ICMP',
+        2: 'IGMP',
+        6: 'TCP',
+        17: 'UDP',
+        41: 'IPv6',
+        47: 'GRE',
+        50: 'ESP',
+        51: 'AH',
+        58: 'ICMPv6',
+        89: 'OSPF',
+        132: 'SCTP'
+    };
+    function normalizeProtocolValue(raw) {
+        if (raw === undefined || raw === null || raw === '') return 'TCP';
+        if (Array.isArray(raw)) raw = raw[0];
+        // If already a recognizable string, return upper-cased canonical form
+        if (typeof raw === 'string') {
+            const upper = raw.trim().toUpperCase();
+            // If it's a numeric string try decoding
+            if (/^\d+$/.test(upper)) {
+                const num = parseInt(upper, 10);
+                return PROTOCOL_MAP[num] ? `${PROTOCOL_MAP[num]} (${num})` : `Unknown (${num})`;
+            }
+            // Already a protocol token
+            return upper || 'TCP';
+        }
+        if (typeof raw === 'number') {
+            return PROTOCOL_MAP[raw] ? `${PROTOCOL_MAP[raw]} (${raw})` : `Unknown (${raw})`;
+        }
+        return 'TCP';
+    }
+    function extractProtocol(p) {
+        if (!p) return 'TCP';
+        const raw = p.protocol ?? p.ip_proto ?? p.ipProtocol ?? p.proto ?? p.ipProtocolNumber;
+        return normalizeProtocolValue(raw);
+    }
     if (data.binned && data.count > 1) {
         // Binned data tooltip
         const { utcTime, timestampSec } = formatTimestamp(data.timestamp);
         let tooltipContent = `<b>${data.flagType} (Binned)</b><br>`;
         tooltipContent += `Count: ${data.count} packets<br>`;
         tooltipContent += `From: ${data.src_ip}<br>To: ${data.dst_ip}<br>`;
+        // Aggregate protocols in the bin (in case of mixed, though unlikely)
+        if (data.originalPackets && data.originalPackets.length) {
+            const protocols = Array.from(new Set(data.originalPackets.map(extractProtocol)));
+            tooltipContent += `Protocol: ${protocols.join(', ')}<br>`;
+        } else {
+            tooltipContent += `Protocol: ${extractProtocol(data)}<br>`;
+        }
         tooltipContent += `Time Bin: ${utcTime}<br>`;
         tooltipContent += `Total Bytes: ${formatBytes(data.totalBytes)}`;
         
@@ -2100,7 +2145,7 @@ function createTooltipHTML(data) {
         // Single packet tooltip
         const packet = data.originalPackets ? data.originalPackets[0] : data;
         const { utcTime, timestampSec } = formatTimestamp(packet.timestamp);
-        let tooltipContent = `<b>${classifyFlags(packet.flags)}</b><br>From: ${packet.src_ip}<br>To: ${packet.dst_ip}<br>Time: ${utcTime}`;
+        let tooltipContent = `<b>${classifyFlags(packet.flags)}</b><br>From: ${packet.src_ip}<br>To: ${packet.dst_ip}<br>Protocol: ${extractProtocol(packet)}<br>Time: ${utcTime}`;
         
         // Add sequence and acknowledgment numbers if available
         if (packet.seq_num !== undefined && packet.seq_num !== null) {
