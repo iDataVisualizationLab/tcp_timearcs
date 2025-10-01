@@ -5,6 +5,7 @@ Converts TCP analysis data to CSV format for analysis and reporting
 """
 
 import pandas as pd
+import numpy as np
 import json
 import sys
 import argparse
@@ -419,6 +420,17 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
         df = pd.read_csv(data_file)
     
     print(f"Loaded {len(df)} records")
+
+    # Robust timestamp cleaning: coerce to numeric, drop NaN/inf
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+        before_drop_count = len(df)
+        df = df[df['timestamp'].notna() & np.isfinite(df['timestamp'])]
+        dropped_count = before_drop_count - len(df)
+        if dropped_count > 0:
+            print(f"Dropped {dropped_count} rows with invalid (NaN/inf) timestamp (remaining {len(df)})")
+    else:
+        print("Warning: 'timestamp' column not found; cannot clean timestamps.", file=sys.stderr)
     
     # Limit records if specified
     if max_records and len(df) > max_records:
@@ -429,19 +441,46 @@ def process_tcp_data(data_file, ip_map_file, output_file, max_records=None, sele
     # We'll ignore non-TCP when detecting TCP flows.
     
     # Convert integer IPs to dotted notation if needed
-    if 'src_ip' in df.columns:
-        if df['src_ip'].dtype in ['int64', 'int32', 'float64', 'float32']:
-            # Convert float to int first, then map to IP
-            df['src_ip'] = df['src_ip'].astype(int).map(int_to_ip).fillna(df['src_ip'].astype(int).astype(str))
+    def _convert_ip_column(df, col_name):
+        if col_name not in df.columns:
+            return
+        series = df[col_name]
+        # Object dtype: identify purely numeric representations and map if possible
+        if series.dtype == object:
+            mask_numeric_like = series.str.fullmatch(r'\d+')
+            if mask_numeric_like.any():
+                numeric = pd.to_numeric(series.where(mask_numeric_like), errors='coerce')
+                mapped = []
+                for v in numeric:
+                    if pd.isna(v):
+                        mapped.append('')
+                        continue
+                    ival = int(v)
+                    if ival in int_to_ip:
+                        mapped.append(int_to_ip[ival])
+                    else:
+                        # Keep original integer string if not in mapping (no dotted fallback)
+                        mapped.append(str(ival))
+                series = series.mask(mask_numeric_like, pd.Series(mapped, index=series.index))
+            df[col_name] = series.fillna('').astype(str)
+            return
+        # Numeric dtypes: map via JSON only; leave as numeric string if not found
+        if series.dtype.kind in 'fi':
+            numeric = pd.to_numeric(series, errors='coerce')
+            out = []
+            for v in numeric:
+                if pd.isna(v):
+                    out.append('')
+                    continue
+                ival = int(v)
+                out.append(int_to_ip.get(ival, str(ival)))
+            df[col_name] = pd.Series(out, index=series.index).fillna('').astype(str)
         else:
-            df['src_ip'] = df['src_ip'].astype(str)
+            df[col_name] = series.astype(str).fillna('')
+
+    _convert_ip_column(df, 'src_ip')
     
-    if 'dst_ip' in df.columns:
-        if df['dst_ip'].dtype in ['int64', 'int32', 'float64', 'float32']:
-            # Convert float to int first, then map to IP
-            df['dst_ip'] = df['dst_ip'].astype(int).map(int_to_ip).fillna(df['dst_ip'].astype(int).astype(str))
-        else:
-            df['dst_ip'] = df['dst_ip'].astype(str)
+    _convert_ip_column(df, 'dst_ip')
     
     # Process flags
     if 'flags' in df.columns:
