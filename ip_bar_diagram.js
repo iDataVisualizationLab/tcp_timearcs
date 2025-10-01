@@ -1,9 +1,9 @@
 // Extracted from ip_arc_diagram_3.html inline script
 // This file contains all logic for the IP Connection Analysis visualization
-import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
+import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowListCapped as sbCreateFlowListCapped, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls, showFlowProgress as sbShowFlowProgress, updateFlowProgress as sbUpdateFlowProgress, hideFlowProgress as sbHideFlowProgress } from './sidebar.js';
 import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, drawFlagLegend as drawFlagLegendFromModule } from './legends.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
-import { GLOBAL_BIN_COUNT } from './config.js';
+import { GLOBAL_BIN_COUNT, FLOW_RECONSTRUCT_BATCH } from './config.js';
 
 // Global debug flag to silence heavy logs in production
 const DEBUG = false;
@@ -2292,7 +2292,7 @@ function updateClosingStats(closings) {
     }
 }
 
-const createFlowList = (flows) => sbCreateFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors);
+const createFlowList = (flows) => sbCreateFlowListCapped(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors);
 
 const updateTcpFlowStats = (flows) => sbUpdateTcpFlowStats(flows, selectedFlowIds, formatBytes);
 
@@ -2598,7 +2598,7 @@ function handleFileLoad(event) {
     const file = event.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = e => {
+    reader.onload = async e => {
         try {
             const csvText = e.target.result;
             const packets = parseCSV(csvText);
@@ -2608,8 +2608,14 @@ function handleFileLoad(event) {
                 fullData = packets;
                 filteredData = [];
 
-                // Process TCP flows from the CSV data (reconstruct from individual packet data)
-                const flowsFromCSV = reconstructFlowsFromCSV(packets);
+                // Process TCP flows with progress
+                try { sbShowFlowProgress('Processing flows…', 0); } catch (_) {}
+                const flowsFromCSV = await reconstructFlowsFromCSVAsync(packets, (processed, total) => {
+                    try {
+                        const pct = total > 0 ? processed / total : 0;
+                        sbUpdateFlowProgress(pct, `Processing flows… ${processed.toLocaleString()}/${total.toLocaleString()}`);
+                    } catch (_) {}
+                });
                 tcpFlows = flowsFromCSV;
                 currentFlows = []; // Initialize as empty - will be populated when IPs are selected
                 selectedFlowIds.clear(); // Clear selected flow IDs
@@ -2640,6 +2646,7 @@ function handleFileLoad(event) {
                 } catch (err) {
                     console.error('Worker init failed', err);
                 }
+                try { sbHideFlowProgress(); } catch (_) {}
             } else {
                 alert('Invalid CSV format: No valid packet data found.');
             }
@@ -2648,6 +2655,62 @@ function handleFileLoad(event) {
         }
     };
     reader.readAsText(file);
+}
+
+// Chunked, async reconstruction to allow UI progress updates
+async function reconstructFlowsFromCSVAsync(packets, onProgress) {
+    const flowMap = new Map();
+    const total = Array.isArray(packets) ? packets.length : 0;
+    const BATCH = Math.max(1000, Number(FLOW_RECONSTRUCT_BATCH) || 5000);
+    let processed = 0;
+    for (let start = 0; start < total; start += BATCH) {
+        const end = Math.min(total, start + BATCH);
+        for (let i = start; i < end; i++) {
+            const packet = packets[i];
+            const flowId = packet.flow_id;
+            if (!flowId || flowId === '') continue;
+            if (!flowMap.has(flowId)) {
+                flowMap.set(flowId, {
+                    id: flowId,
+                    key: makeConnectionKey(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port),
+                    initiator: packet.src_ip,
+                    responder: packet.dst_ip,
+                    initiatorPort: parseInt(packet.src_port) || 0,
+                    responderPort: parseInt(packet.dst_port) || 0,
+                    state: packet.flow_state || 'unknown',
+                    establishmentComplete: packet.establishment_complete === true,
+                    dataTransferStarted: packet.data_transfer_started === true,
+                    closingStarted: packet.closing_started === true,
+                    closeType: packet.flow_close_type || null,
+                    startTime: parseInt(packet.flow_start_time) || packet.timestamp,
+                    endTime: parseInt(packet.flow_end_time) || packet.timestamp,
+                    totalPackets: parseInt(packet.flow_total_packets) || 1,
+                    totalBytes: parseInt(packet.flow_total_bytes) || 0,
+                    invalidReason: packet.flow_invalid_reason || null,
+                    phases: { establishment: [], dataTransfer: [], closing: [] }
+                });
+            } else {
+                const flow = flowMap.get(flowId);
+                flow.startTime = Math.min(flow.startTime, packet.timestamp);
+                flow.endTime = Math.max(flow.endTime, packet.timestamp);
+                if (packet.flow_total_packets) {
+                    const newPackets = parseInt(packet.flow_total_packets);
+                    if (!isNaN(newPackets)) flow.totalPackets = newPackets;
+                }
+                if (packet.flow_total_bytes) {
+                    const newBytes = parseInt(packet.flow_total_bytes);
+                    if (!isNaN(newBytes)) flow.totalBytes = newBytes;
+                }
+            }
+        }
+        processed = end;
+        if (typeof onProgress === 'function') onProgress(processed, total);
+        // Yield to the event loop to update the DOM
+        await new Promise(r => setTimeout(r, 0));
+    }
+    const flows = Array.from(flowMap.values());
+    LOG(`Reconstructed ${flows.length} flows from ${packets.length} packets`);
+    return flows;
 }
 
 function reconstructFlowsFromCSV(packets) {

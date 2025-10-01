@@ -1,6 +1,7 @@
 // Sidebar logic for IP Connection Analysis
 // This file contains all logic for the sidebar UI and its event handlers
 import { getFlowColors, getInvalidLabels, getInvalidReason, getFlowColor } from './legends.js';
+import { MAX_FLOW_LIST_ITEMS, FLOW_LIST_RENDER_BATCH } from './config.js';
 
 export function initSidebar(options) {
     // options: { onResetView, ... }
@@ -98,6 +99,159 @@ export function filterFlowList(searchTerm) {
         const text = (item.innerText || item.textContent || '').toLowerCase();
         item.style.display = text.includes(term) ? '' : 'none';
     });
+}
+
+// Progress UI for flow processing/list rendering
+export function showFlowProgress(label = 'Working…', percent = 0) {
+    const box = document.getElementById('flowProgress');
+    const bar = document.getElementById('flowProgressBar');
+    const lbl = document.getElementById('flowProgressLabel');
+    if (!box || !bar || !lbl) return;
+    box.style.display = 'block';
+    lbl.textContent = label;
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function updateFlowProgress(percent, label) {
+    const bar = document.getElementById('flowProgressBar');
+    if (!bar) return;
+    if (label) {
+        const lbl = document.getElementById('flowProgressLabel');
+        if (lbl) lbl.textContent = label;
+    }
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function hideFlowProgress() {
+    const box = document.getElementById('flowProgress');
+    if (!box) return;
+    box.style.display = 'none';
+}
+
+// Capped + incremental flow list rendering
+export function createFlowListCapped(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors = {}) {
+    const container = document.getElementById('flowList');
+    if (!container) return;
+    if (!flows || flows.length === 0) {
+        container.innerHTML = '<div style="color:#666; text-align:center; padding:20px;">No flows to display</div>';
+        return;
+    }
+
+    // Sort and cap
+    const sorted = [...flows].sort((a, b) => a.startTime - b.startTime);
+    const total = sorted.length;
+    const cap = Math.max(1, Math.min((MAX_FLOW_LIST_ITEMS || total), total));
+    const list = sorted.slice(0, cap);
+
+    // Reset container and add header/notice
+    container.innerHTML = '';
+    const header = document.createElement('div');
+    header.style.cssText = 'font-size:11px; color:#555; margin:4px 2px 8px 2px; display:flex; align-items:center; gap:8px;';
+    header.innerHTML = total > cap
+        ? `<span>Showing first <strong>${cap.toLocaleString()}</strong> of ${total.toLocaleString()} flows</span>`
+        : `<span>Showing <strong>${total.toLocaleString()}</strong> flows</span>`;
+    container.appendChild(header);
+
+    const invalidLabels = getInvalidLabels();
+
+    // Incremental render for responsiveness
+    const BATCH = Math.max(50, Number(FLOW_LIST_RENDER_BATCH) || 200);
+    const shouldShowProgress = cap >= BATCH * 2;
+    if (shouldShowProgress) {
+        showFlowProgress('Rendering flow list…', 0);
+    }
+
+    let index = 0;
+    function renderBatch() {
+        const end = Math.min(cap, index + BATCH);
+        for (let i = index; i < end; i++) {
+            const flow = list[i];
+            const duration = Math.max(0, Math.round((flow.endTime - flow.startTime) / 1000000));
+            const { utcTime: startTime } = formatTimestamp(flow.startTime);
+            const { utcTime: endTime } = formatTimestamp(flow.endTime);
+            const reason = getInvalidReason(flow);
+            const color = getFlowColor(flow, flowColors);
+
+            let closeTypeText = '';
+            if (reason) {
+                const label = invalidLabels[reason] || 'Invalid';
+                closeTypeText = `
+                    <span style="display:inline-flex; align-items:center; gap:6px;">
+                        <span style=\"display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);\"></span>
+                        <span style=\"color:#333;\">${label}</span>
+                    </span>`;
+            } else if (flow.closeType === 'graceful' || flow.closeType === 'abortive') {
+                const label = flow.closeType === 'graceful' ? 'Graceful close' : 'Abortive close';
+                closeTypeText = `
+                    <span style="display:inline-flex; align-items:center; gap:6px;">
+                        <span style=\"display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);\"></span>
+                        <span style=\"color:#333;\">${label}</span>
+                    </span>`;
+            } else if (flow.establishmentComplete) {
+                closeTypeText = '• Still open';
+            } else {
+                closeTypeText = '• Incomplete';
+            }
+
+            const item = document.createElement('div');
+            item.className = 'flow-item';
+            item.dataset.flowId = String(flow.id);
+            item.style.borderLeft = `4px solid ${color}`;
+            item.innerHTML = `
+                <input type=\"checkbox\" class=\"flow-checkbox\" id=\"flow-${flow.id}\" ${selectedFlowIds.has(String(flow.id)) ? 'checked' : ''}>
+                <div class=\"flow-info\">
+                    <div class=\"flow-connection\">${flow.initiator}:${flow.initiatorPort} ↔ ${flow.responder}:${flow.responderPort}</div>
+                    <div class=\"flow-details\">
+                        <span class=\"flow-status ${flow.state}\">${String(flow.state || '').replace('_',' ')}</span>
+                        <span>${flow.totalPackets} packets</span>
+                        <span>${formatBytes(flow.totalBytes)}</span>
+                        <span>${duration}s duration</span>
+                        <span>${closeTypeText}</span>
+                        <button class=\"flow-zoom-btn\" data-flow-id=\"${flow.id}\" title=\"Zoom timeline to this flow\">🔍 Zoom</button>
+                        <button class=\"flow-export-btn\" data-flow-id=\"${flow.id}\" style=\"margin-left:auto; padding:2px 6px; font-size:10px; border:1px solid #ced4da; border-radius:3px; background:#fff; cursor:pointer;\">Export CSV</button>
+                    </div>
+                    <div style=\"font-size:10px; color:#999; margin-top:3px;\">Start: ${startTime} • End: ${endTime}</div>
+                </div>`;
+
+            const cb = item.querySelector('.flow-checkbox');
+            cb.addEventListener('change', (e) => {
+                const flowId = String(flow.id);
+                if (cb.checked) { selectedFlowIds.add(flowId); item.classList.add('selected'); }
+                else { selectedFlowIds.delete(flowId); item.classList.remove('selected'); }
+                if (typeof updateTcpFlowPacketsGlobal === 'function') updateTcpFlowPacketsGlobal();
+            });
+            item.addEventListener('click', (e) => {
+                if (e.target && e.target.type !== 'checkbox') cb.click();
+            });
+            const zoomBtn = item.querySelector('.flow-zoom-btn');
+            zoomBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (typeof zoomToFlow === 'function') zoomToFlow(flow);
+            });
+            const exportBtn = item.querySelector('.flow-export-btn');
+            exportBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (typeof exportFlowToCSV === 'function') exportFlowToCSV(flow);
+            });
+
+            if (selectedFlowIds.has(String(flow.id))) item.classList.add('selected');
+            container.appendChild(item);
+        }
+
+        index = end;
+        if (shouldShowProgress) {
+            updateFlowProgress(end / cap);
+        }
+        if (index < cap) {
+            requestAnimationFrame(renderBatch);
+        } else if (shouldShowProgress) {
+            hideFlowProgress();
+        }
+    }
+
+    requestAnimationFrame(renderBatch);
 }
 
 export function wireSidebarControls(opts) {
@@ -351,4 +505,3 @@ export function updateGroundTruthStatsUI(html, ok=true) {
     container.innerHTML = html;
     container.style.color = ok ? '#27ae60' : '#e74c3c';
 }
-

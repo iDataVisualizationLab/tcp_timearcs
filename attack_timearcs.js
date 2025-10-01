@@ -12,6 +12,17 @@
   const container = document.getElementById('chart-container');
   const legendEl = document.getElementById('legend');
   const tooltip = document.getElementById('tooltip');
+  const labelModeRadios = document.querySelectorAll('input[name="labelMode"]');
+
+  // User-selected labeling mode: 'attack' or 'attack_group'
+  let labelMode = 'attack';
+  labelModeRadios.forEach(r => r.addEventListener('change', () => {
+    const sel = Array.from(labelModeRadios).find(r=>r.checked);
+    labelMode = sel ? sel.value : 'attack';
+    if (lastRawCsvRows) {
+      render(rebuildDataFromRawRows(lastRawCsvRows));
+    }
+  }));
 
   const margin = { top: 40, right: 20, bottom: 30, left: 110 };
   let width = 1200; // updated on render
@@ -36,6 +47,10 @@
   let attackIdToName = null; // Map<number, string>
   let colorByAttack = null; // Map<string, string> by canonicalized name
   let rawColorByAttack = null; // original keys
+  // Attack group mapping/color
+  let attackGroupIdToName = null; // Map<number,string>
+  let colorByAttackGroup = null; // canonical map
+  let rawColorByAttackGroup = null;
 
   // Initialize mappings, then try a default CSV load
   (async function init() {
@@ -44,6 +59,8 @@
         loadIpMap(),
         loadEventTypeMap(),
         loadColorMapping(),
+        loadAttackGroupMap(),
+        loadAttackGroupColorMapping(),
       ]);
     } catch (_) { /* non-fatal */ }
     // After maps are ready (or failed gracefully), try default CSV
@@ -61,6 +78,7 @@
       lastRawCsvRows = rows; // cache raw rows
       const data = rows.map((d, i) => {
         const attackName = decodeAttack(d.attack);
+        const attackGroupName = decodeAttackGroup(d.attack_group, d.attack);
         return {
           idx: i,
           timestamp: toNumber(d.timestamp),
@@ -70,6 +88,7 @@
           protocol: (d.protocol || '').toUpperCase() || 'OTHER',
           count: toNumber(d.count) || 1,
           attack: attackName,
+          attack_group: attackGroupName,
         };
       }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
 
@@ -178,6 +197,7 @@
   function rebuildDataFromRawRows(rows){
     return rows.map((d, i) => {
       const attackName = decodeAttack(d.attack);
+      const attackGroupName = decodeAttackGroup(d.attack_group, d.attack);
       return {
         idx: i,
         timestamp: toNumber(d.timestamp),
@@ -187,12 +207,13 @@
         protocol: (d.protocol || '').toUpperCase() || 'OTHER',
         count: toNumber(d.count) || 1,
         attack: attackName,
+        attack_group: attackGroupName,
       };
     }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
   }
 
   async function tryLoadDefaultCsv() {
-    const defaultPath = './90min_day1_attacks.csv';
+    const defaultPath = './90min_day1_grouped_attacks.csv';
     try {
       const res = await fetch(defaultPath, { cache: 'no-store' });
       if (!res.ok) return; // quietly exit if not found
@@ -201,6 +222,7 @@
       lastRawCsvRows = rows; // cache raw rows
       const data = rows.map((d, i) => {
         const attackName = decodeAttack(d.attack);
+        const attackGroupName = decodeAttackGroup(d.attack_group, d.attack);
         return {
           idx: i,
           timestamp: toNumber(d.timestamp),
@@ -210,6 +232,7 @@
           protocol: (d.protocol || '').toUpperCase() || 'OTHER',
           count: toNumber(d.count) || 1,
           attack: attackName,
+          attack_group: attackGroupName,
         };
       }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
 
@@ -266,7 +289,9 @@
     const links = computeLinks(data); // aggregated per pair per minute
     const nodes = computeNodesByAttackGrouping(links);
     const ips = nodes.map(n => n.name);
-    const attacks = Array.from(new Set(links.map(l => l.attack || 'normal'))).sort();
+  // Determine which label dimension we use (attack vs group) for legend and coloring
+  const activeLabelKey = labelMode === 'attack_group' ? 'attack_group' : 'attack';
+  const attacks = Array.from(new Set(links.map(l => l[activeLabelKey] || 'normal'))).sort();
 
     // Sizing based on number of IPs
     const rowHeight = 18;
@@ -295,13 +320,21 @@
     const rightPad = Math.max(100, maxRadius + 20);
     x.range([margin.left + leftPad, width - margin.right - rightPad]);
 
-    // Width scale by count (fallback to length)
-    const maxCount = d3.max(data, d => d.count || 1) || 1;
+    // Width scale by aggregated link count (log scale like the React version)
+    let minLinkCount = d3.min(links, d => Math.max(1, d.count)) || 1;
+    let maxLinkCount = d3.max(links, d => Math.max(1, d.count)) || 1;
+    // Guard: log scale requires domain > 0 and non-degenerate
+    minLinkCount = Math.max(1, minLinkCount);
+    if (maxLinkCount <= minLinkCount) maxLinkCount = minLinkCount + 1;
+    const widthScale = d3.scaleLog().domain([minLinkCount, maxLinkCount]).range([1, 4]);
+    // Keep lengthScale (unused) for completeness
     const maxLen = d3.max(data, d => d.length || 0) || 0;
-    const widthScale = d3.scaleSqrt().domain([1, Math.max(2, maxCount)]).range([0.6, 2.2]);
-    const lengthScale = d3.scaleSqrt().domain([0, Math.max(1, maxLen)]).range([0.6, 2.2]);
+    const lengthScale = d3.scaleLinear().domain([0, Math.max(1, maxLen)]).range([0.6, 2.2]);
 
-    const colorForAttack = (name) => lookupAttackColor(name) || defaultColor;
+    const colorForAttack = (name) => {
+      if (labelMode === 'attack_group') return lookupAttackGroupColor(name) || lookupAttackColor(name) || defaultColor;
+      return lookupAttackColor(name) || lookupAttackGroupColor(name) || defaultColor;
+    };
 
     // Clear
     svg.selectAll('*').remove();
@@ -374,7 +407,7 @@
       .data(links)
       .join('path')
       .attr('class', 'arc')
-      .attr('stroke', d => colorForAttack(d.attack || 'normal'))
+  .attr('stroke', d => colorForAttack((labelMode==='attack_group'? d.attack_group : d.attack) || 'normal'))
       .attr('stroke-width', d => widthScale(Math.max(1, d.count)))
       .attr('d', d => {
         const xp = x(toDate(d.minute));
@@ -392,9 +425,10 @@
         svg.selectAll('.row-line')
           .attr('stroke-opacity', s => s && s.ip && active.has(s.ip) ? 0.8 : 0.1)
           .attr('stroke-width', s => s && s.ip && active.has(s.ip) ? 1 : 0.4);
+  const attackCol = colorForAttack((labelMode==='attack_group'? d.attack_group : d.attack) || 'normal');
         svg.selectAll('.ip-label')
           .attr('font-weight', s => active.has(s) ? 'bold' : null)
-          .attr('fill', s => active.has(s) ? '#2563eb' : '#343a40');
+          .style('fill', s => active.has(s) ? attackCol : '#343a40');
 
         // Draw a dot at the source node to indicate direction
         const xpDot = x(toDate(d.minute));
@@ -421,7 +455,7 @@
         const dt = toDate(d.minute);
         const timeStr = looksAbsolute ? utcTick(dt) : `t=${d.minute - base} min`;
         const content = `${d.source} → ${d.target}<br>` +
-          `Attack: ${d.attack || 'normal'}<br>` +
+          (labelMode==='attack_group' ? `Attack Group: ${d.attack_group || 'normal'}<br>` : `Attack: ${d.attack || 'normal'}<br>`) +
           `${timeStr}<br>` +
           `count=${d.count}`;
         showTooltip(event, content);
@@ -442,14 +476,14 @@
         svg.selectAll('.row-line').attr('stroke-opacity', 1).attr('stroke-width', 0.4);
         svg.selectAll('.ip-label')
           .attr('font-weight', null)
-          .attr('fill', '#343a40')
+          .style('fill', '#343a40')
           .transition()
           .duration(200)
           .attr('x', margin.left - 8);
         svg.selectAll('.direction-dot').remove();
       });
 
-    status(`${data.length} records • ${ips.length} IPs • ${attacks.length} attack types`);
+    status(`${data.length} records • ${ips.length} IPs • ${attacks.length} ${labelMode==='attack_group' ? 'attack groups' : 'attack types'}`);
   }
 
   function showTooltip(evt, html) {
@@ -556,19 +590,21 @@
   // Compute links: aggregate per (src_ip -> dst_ip, minute), sum counts, pick dominant attack label
   function computeLinks(data) {
     const keyOf = (src, dst, m) => `${src}__${dst}__${m}`; // keep direction
-    const agg = new Map(); // key -> {source, target, minute, count, attackCounts}
+    const agg = new Map(); // key -> {source, target, minute, count, attackCounts, attackGroupCounts}
     for (const row of data) {
       const src = row.src_ip, dst = row.dst_ip, m = row.timestamp;
       const k = keyOf(src, dst, m);
       let rec = agg.get(k);
       if (!rec) {
-        rec = { source: src, target: dst, minute: m, count: 0, attackCounts: new Map() };
+        rec = { source: src, target: dst, minute: m, count: 0, attackCounts: new Map(), attackGroupCounts: new Map() };
         agg.set(k, rec);
       }
       const c = (row.count || 1);
       rec.count += c;
       const att = (row.attack || 'normal');
       rec.attackCounts.set(att, (rec.attackCounts.get(att) || 0) + c);
+      const attg = (row.attack_group || 'normal');
+      rec.attackGroupCounts.set(attg, (rec.attackGroupCounts.get(attg) || 0) + c);
     }
     // Choose dominant attack per aggregated link
     const links = [];
@@ -577,7 +613,11 @@
       for (const [att, c] of rec.attackCounts.entries()) {
         if (c > bestCnt) { bestCnt = c; bestAttack = att; }
       }
-      links.push({ source: rec.source, target: rec.target, minute: rec.minute, count: rec.count, attack: bestAttack });
+      let bestGroup = 'normal', bestGroupCnt = -1;
+      for (const [attg, c] of rec.attackGroupCounts.entries()) {
+        if (c > bestGroupCnt) { bestGroupCnt = c; bestGroup = attg; }
+      }
+      links.push({ source: rec.source, target: rec.target, minute: rec.minute, count: rec.count, attack: bestAttack, attack_group: bestGroup });
     }
     // Sort chronologically then by strength for deterministic rendering
     links.sort((a, b) => (a.minute - b.minute) || (b.count - a.count) || a.source.localeCompare(b.source));
@@ -723,6 +763,20 @@
     return v;
   }
 
+  function decodeAttackGroup(groupVal, fallbackAttackVal) {
+    // If the CSV column missing (undefined/null/empty), gracefully fall back to decoded attack.
+    const raw = (groupVal ?? '').toString().trim();
+    if (!raw) {
+      // fallback: attempt to map via attack->group if we have a mapping of attack ids? (Not specified) just reuse attack
+      return decodeAttack(fallbackAttackVal);
+    }
+    const n = Number(raw);
+    if (Number.isFinite(n) && attackGroupIdToName) {
+      return attackGroupIdToName.get(n) || decodeAttack(fallbackAttackVal);
+    }
+    return raw; // assume already a name
+  }
+
   function canonicalizeName(s) {
     return s
       .toLowerCase()
@@ -739,6 +793,19 @@
     // best-effort partial match
     if (colorByAttack) {
       for (const [k, col] of colorByAttack.entries()) {
+        if (k.includes(key) || key.includes(k)) return col;
+      }
+    }
+    return null;
+  }
+
+  function lookupAttackGroupColor(name) {
+    if (!name) return null;
+    if (rawColorByAttackGroup && rawColorByAttackGroup.has(name)) return rawColorByAttackGroup.get(name);
+    const key = canonicalizeName(name);
+    if (colorByAttackGroup && colorByAttackGroup.has(key)) return colorByAttackGroup.get(key);
+    if (colorByAttackGroup) {
+      for (const [k,col] of colorByAttackGroup.entries()) {
         if (k.includes(key) || key.includes(k)) return col;
       }
     }
@@ -776,6 +843,52 @@
       console.warn('Failed to load color_mapping.json; default colors will be used.', err);
       colorByAttack = null;
       rawColorByAttack = null;
+    }
+  }
+
+  async function loadAttackGroupMap() {
+    try {
+      const res = await fetch('./attack_group_mapping.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const obj = await res.json(); // name -> id or id -> name
+      const entries = Object.entries(obj);
+      const rev = new Map();
+      if (entries.length) {
+        let nameToId = 0, idToName = 0;
+        for (const [k,v] of entries.slice(0,10)) {
+          if (typeof v === 'number') nameToId++;
+          if (!isNaN(+k) && typeof v === 'string') idToName++;
+        }
+        if (nameToId >= idToName) {
+          for (const [name,id] of entries) {
+            const num = Number(id); if (Number.isFinite(num)) rev.set(num, name);
+          }
+        } else {
+          for (const [idStr,name] of entries) {
+            const num = Number(idStr); if (Number.isFinite(num) && typeof name === 'string') rev.set(num, name);
+          }
+        }
+      }
+      attackGroupIdToName = rev;
+    } catch (err) {
+      console.warn('Failed to load attack_group_mapping.json; attack groups may show raw values.', err);
+      attackGroupIdToName = null;
+    }
+  }
+
+  async function loadAttackGroupColorMapping() {
+    try {
+      const res = await fetch('./attack_group_color_mapping.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const obj = await res.json(); // name -> color
+      rawColorByAttackGroup = new Map(Object.entries(obj));
+      colorByAttackGroup = new Map();
+      for (const [name,col] of Object.entries(obj)) {
+        colorByAttackGroup.set(canonicalizeName(name), col);
+      }
+    } catch (err) {
+      console.warn('Failed to load attack_group_color_mapping.json; default colors will be used for groups.', err);
+      colorByAttackGroup = null; rawColorByAttackGroup = null;
     }
   }
 })();
