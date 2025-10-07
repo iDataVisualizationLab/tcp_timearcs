@@ -1416,8 +1416,8 @@ function drawGroundTruthBoxes(selectedIPs) {
         if (d.wasExpanded) {
             // Original stop was same as start; show both
             tooltipContent += `Original Stop: ${d.event.stopTime}<br>`;
-            tooltipContent += `Expanded Stop (+59s): ${expandedStopStr}<br>`;
-            tooltipContent += `Expanded Duration: ${durationSec}s`;
+            tooltipContent += `Estimated Stop (+59s): ${expandedStopStr}<br>`;
+            tooltipContent += `Estimated Duration: ${durationSec}s`;
         } else {
             tooltipContent += `Stop: ${d.event.stopTime}<br>`;
             tooltipContent += `Duration: ${durationSec}s`;
