@@ -1,6 +1,6 @@
 // Extracted from ip_arc_diagram_3.html inline script
 // This file contains all logic for the IP Connection Analysis visualization
-import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
+import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls, showCsvProgress as sbShowCsvProgress, updateCsvProgress as sbUpdateCsvProgress, hideCsvProgress as sbHideCsvProgress } from './sidebar.js';
 import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, drawFlagLegend as drawFlagLegendFromModule } from './legends.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
 import { GLOBAL_BIN_COUNT } from './config.js';
@@ -408,6 +408,7 @@ function initializeArcVisualization() {
         getCurrentFlows: () => currentFlows,
         getSelectedFlowIds: () => selectedFlowIds,
         updateTcpFlowPacketsGlobal: () => updateTcpFlowPacketsGlobal(),
+        createFlowList: (flows) => createFlowList(flows),
         sbRenderInvalidLegend: (panel, html, title) => sbRenderInvalidLegend(panel, html, title),
         sbRenderClosingLegend: (panel, html, title) => sbRenderClosingLegend(panel, html, title),
         makeConnectionKey: (a,b,c,d) => makeConnectionKey(a,b,c,d),
@@ -1417,7 +1418,7 @@ function drawGroundTruthBoxes(selectedIPs) {
             // Original stop was same as start; show both
             tooltipContent += `Original Stop: ${d.event.stopTime}<br>`;
             tooltipContent += `Estimated Stop (+59s): ${expandedStopStr}<br>`;
-            tooltipContent += `Estimated Duration: ${durationSec}s`;
+            tooltipContent += `Estimated Duration: ~${durationSec}s`;
         } else {
             tooltipContent += `Stop: ${d.event.stopTime}<br>`;
             tooltipContent += `Duration: ${durationSec}s`;
@@ -1549,8 +1550,7 @@ async function updateIPFilter() {
         // Clear selection to avoid stale selection across different IP filters
         selectedFlowIds.clear();
 
-        // Update flow list and stats based on currentFlows
-        createFlowList(currentFlows);
+        // Update flow stats (flow list will be populated when user clicks on overview chart)
         updateTcpFlowStats(currentFlows);
         
         // Update ground truth statistics
@@ -2320,6 +2320,96 @@ function binPackets(packets, xScale, yScale, timeExtent) {
     return binnedData;
 }
 
+// Async CSV parsing with progress tracking
+async function parseCSVAsync(csvText, onProgress) {
+    const lines = csvText.split('\n').filter(line => line.trim().length > 0);
+    if (lines.length < 2) return [];
+    
+    // Parse header line
+    const headerLine = lines[0];
+    const headers = [];
+    let current = '';
+    let inQuotes = false;
+    
+    for (let j = 0; j < headerLine.length; j++) {
+        const char = headerLine[j];
+        if (char === '"') {
+            inQuotes = !inQuotes;
+        } else if (char === ',' && !inQuotes) {
+            headers.push(current.trim());
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    headers.push(current.trim());
+    
+    const packets = [];
+    const totalLines = lines.length - 1; // Exclude header
+    const BATCH_SIZE = 1000; // Process in batches for progress updates
+    
+    for (let i = 1; i < lines.length; i += BATCH_SIZE) {
+        const endIndex = Math.min(i + BATCH_SIZE, lines.length);
+        
+        for (let lineIndex = i; lineIndex < endIndex; lineIndex++) {
+            const line = lines[lineIndex];
+            if (!line.trim()) continue;
+            
+            const values = [];
+            current = '';
+            inQuotes = false;
+            
+            for (let j = 0; j < line.length; j++) {
+                const char = line[j];
+                if (char === '"') {
+                    inQuotes = !inQuotes;
+                } else if (char === ',' && !inQuotes) {
+                    values.push(current.trim());
+                    current = '';
+                } else {
+                    current += char;
+                }
+            }
+            values.push(current.trim());
+            
+            if (values.length >= headers.length) {
+                const packet = {};
+                for (let k = 0; k < headers.length; k++) {
+                    const header = headers[k].toLowerCase().replace(/[^a-z0-9]/g, '_');
+                    let value = values[k];
+                    
+                    // Type conversion
+                    if (header.includes('time') || header.includes('timestamp')) {
+                        value = parseFloat(value) || 0;
+                    } else if (header.includes('length') || header.includes('size') || header.includes('port') || header.includes('seq') || header.includes('ack')) {
+                        value = parseInt(value) || 0;
+                    }
+                    
+                    packet[header] = value;
+                }
+                
+                if (packet.src_ip && packet.dst_ip && packet.timestamp) {
+                    packets.push(packet);
+                }
+            }
+        }
+        
+        // Update progress
+        if (onProgress) {
+            const progress = (endIndex - 1) / totalLines;
+            onProgress(progress, `Parsing CSV... ${(endIndex - 1).toLocaleString()}/${totalLines.toLocaleString()} lines`);
+        }
+        
+        // Allow UI to update
+        if (i % (BATCH_SIZE * 5) === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+    
+    LOG(`Parsed ${packets.length} packets from ${lines.length - 1} CSV lines`);
+    return packets;
+}
+
 // CSV parsing helper function
 function parseCSV(csvText) {
     const lines = csvText.split('\n').filter(line => line.trim().length > 0);
@@ -2407,11 +2497,21 @@ function parseCSV(csvText) {
 function handleFileLoad(event) {
     const file = event.target.files[0];
     if (!file) return;
+    
+    // Show CSV loading progress
+    try { sbShowCsvProgress('Reading CSV file...', 0); } catch (_) {}
+    
     const reader = new FileReader();
-    reader.onload = e => {
+    reader.onload = async e => {
         try {
             const csvText = e.target.result;
-            const packets = parseCSV(csvText);
+            
+            // Update progress for parsing phase
+            try { sbUpdateCsvProgress(0.1, 'Parsing CSV data...'); } catch (_) {}
+            
+            const packets = await parseCSVAsync(csvText, (progress, label) => {
+                try { sbUpdateCsvProgress(0.1 + (progress * 0.4), label); } catch (_) {}
+            });
             
             if (packets && packets.length > 0) {
                 // Packets
@@ -2419,6 +2519,7 @@ function handleFileLoad(event) {
                 filteredData = [];
 
                 // Process TCP flows from the CSV data (reconstruct from individual packet data)
+                try { sbUpdateCsvProgress(0.5, 'Processing TCP flows...'); } catch (_) {}
                 const flowsFromCSV = reconstructFlowsFromCSV(packets);
                 tcpFlows = flowsFromCSV;
                 currentFlows = []; // Initialize as empty - will be populated when IPs are selected
@@ -2427,6 +2528,7 @@ function handleFileLoad(event) {
                 updateTcpFlowStats(currentFlows); // Show initial message about selecting IPs
 
                 // IPs - extract unique IPs from packet data
+                try { sbUpdateCsvProgress(0.9, 'Extracting IP addresses...'); } catch (_) {}
                 const uniqueIPs = Array.from(new Set(fullData.flatMap(p => [p.src_ip, p.dst_ip]))).filter(Boolean);
                 createIPCheckboxes(uniqueIPs);
 
@@ -2440,6 +2542,7 @@ function handleFileLoad(event) {
                 verifyFlowPacketConnection(packets, flowsFromCSV);
                 // Initialize web worker after packets parsed
                 try {
+                    try { sbUpdateCsvProgress(0.95, 'Initializing web worker...'); } catch (_) {}
                     initPacketWorker();
                     // Assign stable index for each packet corresponding to position in filteredData later
                     packets.forEach((p, i) => p._packetIndex = i);
@@ -2450,10 +2553,18 @@ function handleFileLoad(event) {
                 } catch (err) {
                     console.error('Worker init failed', err);
                 }
+                
+                // Complete loading
+                try { sbUpdateCsvProgress(1.0, 'Loading complete!'); } catch (_) {}
+                setTimeout(() => {
+                    try { sbHideCsvProgress(); } catch (_) {}
+                }, 1000);
             } else {
+                try { sbHideCsvProgress(); } catch (_) {}
                 alert('Invalid CSV format: No valid packet data found.');
             }
         } catch (error) { 
+            try { sbHideCsvProgress(); } catch (_) {}
             alert('Error parsing CSV file: ' + error.message); 
         }
     };

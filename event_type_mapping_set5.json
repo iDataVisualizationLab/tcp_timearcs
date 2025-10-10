@@ -1,0 +1,6 @@
+{
+    "ddos": 0,
+    "scan /usr/bin/nmap": 1,
+    "failed attack framework-2.6/msfcli iis_nsiislog_po": 2,
+    "failed attack exploit/iis-asp-overflow": 3
+}

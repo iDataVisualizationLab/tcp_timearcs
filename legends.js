@@ -282,7 +282,10 @@ export function drawFlagLegend({ svg, width, height, flagColors, globalMaxBinCou
         const legendX = Math.max(0, sizeLegendX - 12 - fWidth);
     const legendY = Math.max(0, (anchorY - fHeight - 8));
 
-        const g = svg.append('g').attr('class', 'flag-legend').attr('transform', `translate(${legendX},${legendY})`);
+        const g = svg.append('g')
+            .attr('class', 'flag-legend')
+            .attr('transform', `translate(${legendX},${legendY})`)
+            .style('pointer-events', 'none');
 
         // Background
         g.append('rect')

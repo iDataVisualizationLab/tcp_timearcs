@@ -2,6 +2,7 @@
 *.csv
 !GroundTruth_UTC_naive.csv
 !90min_day1_grouped_attacks.csv
+!.cursorignore
 
 # Ignore hidden files (dotfiles) but keep this file
 .*

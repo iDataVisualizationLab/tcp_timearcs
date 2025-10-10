@@ -281,6 +281,8 @@
             display: block;
             width: 100%; /* width managed by attributes from JS */
             height: auto;
+            /* Ensure overlay doesn't intercept mouse events over the chart */
+            pointer-events: none;
         }
         
         #overview-chart {
@@ -347,6 +349,74 @@
             width: 100%;
         }
 
+        /* Flow List Modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: transparent; /* do not dim or block */
+            display: none; /* toggled via JS */
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+            pointer-events: none; /* allow interactions with the page */
+        }
+        .modal {
+            background: #fff;
+            width: min(420px, 45vw);
+            max-height: 50vh;
+            border-radius: 8px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: absolute; /* allow dragging by setting explicit top/left */
+            pointer-events: auto; /* remain interactive while overlay is click-through */
+        }
+        .modal-header {
+            padding: 10px 14px;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: move;            /* indicate draggable area */
+            user-select: none;       /* avoid text selection while dragging */
+        }
+        .modal-header h3 {
+            margin: 0;
+            font-size: 14px;
+            color: #2c3e50;
+            font-weight: 600;
+        }
+        .modal-body {
+            padding: 10px;
+            overflow: auto;
+        }
+        .modal-actions {
+            padding: 8px 10px;
+            border-top: 1px solid #e9ecef;
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+        .modal-close-btn {
+            border: 1px solid #ced4da;
+            background: #fff;
+            border-radius: 4px;
+            padding: 5px 8px;
+            cursor: pointer;
+        }
+        .modal-primary-btn {
+            border: 1px solid #0d6efd;
+            background: #0d6efd;
+            color: #fff;
+            border-radius: 4px;
+            padding: 5px 8px;
+            cursor: pointer;
+        }
+
+        /* Prevent overlay container from blocking interactions as well */
+        #chart-bottom-overlay { pointer-events: none; }
+
     </style>
 </head>
 <body>
@@ -372,6 +442,12 @@
         <div class="control-group">
             <label for="dataFile">Data File</label>
             <input type="file" id="dataFile" accept=".csv" />
+            <div id="csvProgress" style="display: none; margin-top: 8px; padding: 8px; background: #f8f9fa; border-radius: 4px; border: 1px solid #dee2e6;">
+                <div style="font-size: 11px; color: #555; margin-bottom: 4px;" id="csvProgressLabel">Loading CSV file...</div>
+                <div style="width: 100%; height: 6px; background: #e9ecef; border-radius: 3px; overflow: hidden;">
+                    <div id="csvProgressBar" style="width: 0%; height: 100%; background: #007bff; transition: width 0.3s ease;"></div>
+                </div>
+            </div>
         </div>
         <div class="control-group">
             <label>IP Addresses</label>
@@ -420,28 +496,7 @@
                 </div>
             </div>
         </div>
-        <div class="control-group">
-            <label>Flow Selection</label>
-            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
-                <div style="margin-bottom: 10px;">
-                    <input type="text" id="flowSearch" placeholder="Search flows..." style="width: 100%; padding: 5px; margin-bottom: 10px; border: 1px solid #ced4da; border-radius: 3px;">
-                    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
-                        <button id="selectAllFlows" style="padding: 4px 8px; font-size: 11px;">Select All</button>
-                        <button id="clearAllFlows" style="padding: 4px 8px; font-size: 11px;">Clear All</button>
-                        <button id="selectEstablishedFlows" style="padding: 4px 8px; font-size: 11px;">Established Only</button>
-                    </div>
-                </div>
-                <div id="flowProgress" style="display:none; margin-bottom: 10px;">
-                    <div id="flowProgressLabel" style="font-size: 11px; color: #666; margin-bottom: 4px;">Processing flows…</div>
-                    <div style="background:#e9ecef; border-radius:3px; height:8px; overflow:hidden;">
-                        <div id="flowProgressBar" style="width:0%; height:100%; background:#0d6efd; transition: width 0.12s ease;"></div>
-                    </div>
-                </div>
-                <div id="flowList" style="max-height: 300px; overflow-y: auto; border: 1px solid #e9ecef; border-radius: 3px; padding: 5px;">
-                    <div style="color: #666; text-align: center; padding: 20px;">No flows to display</div>
-                </div>
-            </div>
-        </div>
+        
         <div class="control-group">
             <label>Ground Truth Events</label>
             <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
@@ -486,6 +541,26 @@
       </aside>
     </div>
     <div id="tooltip" class="tooltip" style="display: none;"></div>
+    <!-- Flow List Modal -->
+    <div id="flowListModalOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="flowListModalTitle">
+        <div class="modal" id="flowListModal">
+            <div class="modal-header">
+                <h3 id="flowListModalTitle">Flows</h3>
+                <div id="flowListModalCount" style="margin-left:auto; color:#6c757d; font-size:12px;"></div>
+            </div>
+            <div class="modal-body">
+                <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center;">
+                    <input type="text" id="flowListModalSearch" placeholder="Search flows..." style="flex:1; padding:6px; border:1px solid #ced4da; border-radius:4px;">
+                    <button id="flowListModalSelectAll" class="modal-primary-btn" title="Select all flows in this list">Select All</button>
+                    <button id="flowListModalClearAll" class="modal-close-btn" title="Clear selection for this list">Clear All</button>
+                </div>
+                <div id="flowListModalList" style="max-height:60vh; overflow:auto; border:1px solid #e9ecef; border-radius:6px; padding:6px; background:#fff;"></div>
+            </div>
+            <div class="modal-actions">
+                <button id="flowListModalClose" class="modal-close-btn">Close</button>
+            </div>
+        </div>
+    </div>
     <script type="module" src="./viewer_loader.js"></script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 // Overview chart module: manages stacked invalid flows overview, brush, and legends
 import { GLOBAL_BIN_COUNT } from './config.js';
 import { createOverviewFlowLegend } from './legends.js';
+import { showFlowListModal } from './sidebar.js';
 // Internal state
 let overviewSvg, overviewXScale, overviewBrush, overviewWidth = 0, overviewHeight = 100;
 let isUpdatingFromBrush = false; // prevent circular updates
@@ -21,6 +22,7 @@ let makeConnectionKeyRef = null;
 let hiddenInvalidReasonsRef = null;
 let hiddenCloseTypesRef = null;
 let applyInvalidReasonFilterRef = null; // callback from main to hide/show dots/arcs
+let createFlowListRef = null; // callback to populate flow list
 
 // Config shared with main (imported)
 let flagColors = {};
@@ -41,6 +43,7 @@ export function initOverview(options) {
     hiddenInvalidReasonsRef = options.hiddenInvalidReasons;
     hiddenCloseTypesRef = options.hiddenCloseTypes;
     applyInvalidReasonFilterRef = options.applyInvalidReasonFilter;
+    createFlowListRef = options.createFlowList;
     // Bin count is centralized in config.js; ignore per-call overrides
     flagColors = options.flagColors || {};
     flowColors = options.flowColors || {};
@@ -443,78 +446,15 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         .on('mouseover', (event, d) => amplifyBinBand(d.binIndex, d.kind))
         .on('mouseout', (event, d) => resetBinBand(d.binIndex, d.kind))
         .on('click', (event, d) => {
-            const timeExtent = getTimeExtentRef();
-            if (!timeExtent) return;
-            const width = getWidthRef();
-            const binCount = GLOBAL_BIN_COUNT;
-            const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
-            const timeBinSize = totalRange / binCount;
-
-            // Gather ALL flows in this bin across bands
-            const idx = d.binIndex;
-            const flowsInBin = new Set();
-            const addFromMap = (m) => {
-                const mm = m.get(idx);
-                if (!mm) return;
-                for (const arr of mm.values()) {
-                    if (Array.isArray(arr)) arr.forEach(f => { if (f) flowsInBin.add(f); });
-                }
-            };
-            try { addFromMap(binReasonMap); } catch {}
-            try { addFromMap(binCloseMap); } catch {}
-            try { addFromMap(binOngoingMap); } catch {}
-
-            let minTs = Infinity, maxTs = -Infinity;
-            flowsInBin.forEach(f => {
-                if (!f) return;
-                if (Number.isFinite(f.startTime)) minTs = Math.min(minTs, Math.floor(f.startTime));
-                if (Number.isFinite(f.endTime)) maxTs = Math.max(maxTs, Math.floor(f.endTime));
-            });
-
-            // Fallback to bin boundaries if no flows collected
-            if (!Number.isFinite(minTs) || !Number.isFinite(maxTs) || maxTs <= minTs) {
-                const binStartTime = timeExtent[0] + (d.binIndex * timeBinSize);
-                const binEndTime = binStartTime + timeBinSize;
-                minTs = Math.floor(binStartTime);
-                maxTs = Math.ceil(binEndTime);
-            }
-
-            // Tight padding similar to zoomToFlow()
-            const timePerPixel = totalRange / Math.max(1, width);
-            const minPaddingUs = 50000; // 0.05s
-            const paddingPixels = 2;
-            const paddingPercent = 0.005; // 0.5%
-            const paddingFromPixels = Math.ceil(paddingPixels * timePerPixel);
-            const duration = Math.max(1, maxTs - minTs);
-            const paddingFromPercent = Math.ceil(duration * paddingPercent);
-            const cappedPercentPadding = Math.min(paddingFromPercent, Math.ceil(duration * 0.25));
-            const padding = Math.max(minPaddingUs, Math.min(paddingFromPixels, cappedPercentPadding));
-            let a = Math.max(timeExtent[0], Math.floor(minTs - padding));
-            let b = Math.min(timeExtent[1], Math.ceil(maxTs + padding));
-            if (b <= a) b = Math.min(timeExtent[1], a + 1);
-
-            applyZoomDomainRef([a, b], 'flow');
-            try { updateBrushFromZoom(); } catch {}
-
-            // Select ALL flows in the bin so link arcs render when zoomed
+            // Populate flow list with the flows represented by this specific segment
             try {
-                const idsToSelect = new Set(Array.from(flowsInBin).map(f => String(f.id)));
-                const selectedFlowIds = getSelectedFlowIdsRef();
-                selectedFlowIds.clear();
-                idsToSelect.forEach(id => selectedFlowIds.add(id));
-                const list = document.getElementById('flowList');
-                if (list) {
-                    list.querySelectorAll('.flow-item').forEach(item => {
-                        const fid = item.getAttribute('data-flow-id');
-                        const checked = idsToSelect.has(String(fid));
-                        const checkbox = item.querySelector('.flow-checkbox');
-                        if (checkbox) checkbox.checked = checked;
-                        if (checked) item.classList.add('selected'); else item.classList.remove('selected');
-                    });
+                const segFlows = Array.isArray(d.flows) ? d.flows : [];
+                if (typeof createFlowListRef === 'function') {
+                    createFlowListRef(segFlows);
                 }
-                updateTcpFlowPacketsGlobalRef();
+                try { showFlowListModal(); } catch {}
             } catch (e) {
-                console.warn('Failed to select flows from overview bin click:', e);
+                console.warn('Failed to populate flow list from overview segment click:', e);
             }
         })
         .append('title')
@@ -544,6 +484,14 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             const x = x0;
             const axis = (overviewHeight - 30);
 
+            // Collect flows for each band within this bin
+            const mTop = binCloseMap.get(i) || new Map();
+            const flowsClosing = Array.from(mTop.values()).flat();
+            const mMid = binOngoingMap.get(i) || new Map();
+            const flowsOngoing = Array.from(mMid.values()).flat();
+            const mBot = binReasonMap.get(i) || new Map();
+            const flowsInvalid = Array.from(mBot.values()).flat();
+
             // One full-height column hit area per bin
             const col = hitGroup.append('rect')
                 .attr('class', 'overview-bin-hit column')
@@ -554,6 +502,7 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                 .style('fill', 'transparent')
                 .style('pointer-events', 'all')
                 .style('cursor', 'pointer')
+                .datum({ binIndex: i, flows: { closing: flowsClosing, ongoing: flowsOngoing, invalid: flowsInvalid } })
                 .on('mousemove', (event) => {
                     // Determine band by mouse Y within the column
                     const p = d3.pointer(event, overviewSvg.node());
@@ -573,71 +522,17 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                     if (prev) resetBinBand(i, prev);
                     lastBandByBin.delete(i);
                 })
-                .on('click', () => {
-                    // Gather ALL flows in this bin and zoom to first/last arc across them
-                    const width = getWidthRef();
-                    const totalRange = Math.max(1, timeExtent[1] - timeExtent[0]);
-                    const timeBinSize = totalRange / binCount;
-                    const flowsInBin = new Set();
-                    const addFromMap = (m) => {
-                        const mm = m.get(i);
-                        if (!mm) return;
-                        for (const arr of mm.values()) {
-                            if (Array.isArray(arr)) arr.forEach(f => { if (f) flowsInBin.add(f); });
-                        }
-                    };
-                    try { addFromMap(binReasonMap); } catch {}
-                    try { addFromMap(binCloseMap); } catch {}
-                    try { addFromMap(binOngoingMap); } catch {}
-
-                    let minTs = Infinity, maxTs = -Infinity;
-                    flowsInBin.forEach(f => {
-                        if (!f) return;
-                        if (Number.isFinite(f.startTime)) minTs = Math.min(minTs, Math.floor(f.startTime));
-                        if (Number.isFinite(f.endTime)) maxTs = Math.max(maxTs, Math.floor(f.endTime));
-                    });
-
-                    if (!Number.isFinite(minTs) || !Number.isFinite(maxTs) || maxTs <= minTs) {
-                        const binStartTime = timeExtent[0] + (i * timeBinSize);
-                        const binEndTime = binStartTime + timeBinSize;
-                        minTs = Math.floor(binStartTime);
-                        maxTs = Math.ceil(binEndTime);
-                    }
-
-                    const timePerPixel = totalRange / Math.max(1, width);
-                    const minPaddingUs = 50000; // 0.05s
-                    const paddingPixels = 2;
-                    const paddingPercent = 0.005;
-                    const paddingFromPixels = Math.ceil(paddingPixels * timePerPixel);
-                    const duration = Math.max(1, maxTs - minTs);
-                    const paddingFromPercent = Math.ceil(duration * paddingPercent);
-                    const cappedPercentPadding = Math.min(paddingFromPercent, Math.ceil(duration * 0.25));
-                    const padding = Math.max(minPaddingUs, Math.min(paddingFromPixels, cappedPercentPadding));
-                    let a = Math.max(timeExtent[0], Math.floor(minTs - padding));
-                    let b = Math.min(timeExtent[1], Math.ceil(maxTs + padding));
-                    if (b <= a) b = Math.min(timeExtent[1], a + 1);
-                    applyZoomDomainRef([a, b], 'overview');
-                    try { updateBrushFromZoom(); } catch {}
-
-                    // Select flows so link arcs are drawn
+                .on('click', (event, d) => {
+                    // Populate flow list based on the last hovered band for this bin
                     try {
-                        const idsToSelect = new Set(Array.from(flowsInBin).map(f => String(f.id)));
-                        const selectedFlowIds = getSelectedFlowIdsRef();
-                        selectedFlowIds.clear();
-                        idsToSelect.forEach(id => selectedFlowIds.add(id));
-                        const list = document.getElementById('flowList');
-                        if (list) {
-                            list.querySelectorAll('.flow-item').forEach(item => {
-                                const fid = item.getAttribute('data-flow-id');
-                                const checked = idsToSelect.has(String(fid));
-                                const checkbox = item.querySelector('.flow-checkbox');
-                                if (checkbox) checkbox.checked = checked;
-                                if (checked) item.classList.add('selected'); else item.classList.remove('selected');
-                            });
+                        const band = lastBandByBin.get(i) || 'invalid';
+                        const flows = (d && d.flows && Array.isArray(d.flows[band])) ? d.flows[band] : [];
+                        if (typeof createFlowListRef === 'function') {
+                            createFlowListRef(flows);
                         }
-                        updateTcpFlowPacketsGlobalRef();
+                        try { showFlowListModal(); } catch {}
                     } catch (e) {
-                        console.warn('Failed to select flows from overview column click:', e);
+                        console.warn('Failed to populate flow list from overview column click:', e);
                     }
                 });
         }
@@ -725,16 +620,38 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
             hiddenCloseTypes: hiddenCloseTypesRef,
             d3: d3,
             onToggleReason: (reason) => {
-                const setRef = hiddenInvalidReasonsRef;
-                if (setRef.has(reason)) setRef.delete(reason); else setRef.add(reason);
-                try { updateOverviewInvalidVisibility(); } catch {}
-                try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+                // Filter flows by invalid reason and populate flow list
+                const allFlows = getCurrentFlowsRef();
+                const filteredFlows = allFlows.filter(f => {
+                    if (!f) return false;
+                    const fReason = f.invalidReason;
+                    if (fReason && fReason === reason) return true;
+                    if (!fReason && (f.closeType === 'invalid' || f.state === 'invalid') && reason === 'unknown_invalid') return true;
+                    return false;
+                });
+                
+                if (typeof createFlowListRef === 'function') {
+                    createFlowListRef(filteredFlows);
+                }
+                try { showFlowListModal(); } catch {}
             },
             onToggleCloseType: (closeType) => {
-                const setRef = hiddenCloseTypesRef;
-                if (setRef.has(closeType)) setRef.delete(closeType); else setRef.add(closeType);
-                try { updateOverviewInvalidVisibility(); } catch {}
-                try { if (typeof applyInvalidReasonFilterRef === 'function') applyInvalidReasonFilterRef(); } catch {}
+                // Filter flows by close type and populate flow list
+                const allFlows = getCurrentFlowsRef();
+                const filteredFlows = allFlows.filter(f => {
+                    if (!f) return false;
+                    if (closeType === 'open') {
+                        return f && !(f.closeType === 'invalid' || f.state === 'invalid' || !!f.invalidReason) && 
+                               !(f.closeType === 'graceful' || f.closeType === 'abortive') &&
+                               (f.establishmentComplete === true || f.state === 'established' || f.state === 'data_transfer');
+                    }
+                    return f.closeType === closeType;
+                });
+                
+                if (typeof createFlowListRef === 'function') {
+                    createFlowListRef(filteredFlows);
+                }
+                try { showFlowListModal(); } catch {}
             }
         });
     } catch (error) {
