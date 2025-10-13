@@ -1,5 +1,4 @@
 {
-    "normal": -1,
     "client compromise": 0,
     "malware ddos": 1,
     "scan /usr/bin/nmap": 2,
@@ -20,5 +19,14 @@
     "post-phishing c2 + tcp control channel exfil nc": 17,
     "break-DNS_1_exploit echo": 18,
     "c2 remote command execution nc": 19,
-    "c2 + tcp control channel exfil nc": 20
+    "c2+ tcp control channel exfil nc": 20,
+    "failed attack framework-2.6/msfcli windows_ssl_pct": 21,
+    "failed attack exploit/iis-asp-overflow": 22,
+    "failed attack or scan exploit/bin/iis_nsiislog.pl": 23,
+    "post-phishing c2 echo": 24,
+    "post-phishing icmp exfil nc": 25,
+    "client compromise exfil/sams_launch_vulnerable_cli": 26,
+    "out2in": 27,
+    "compromised_server": 28,
+    "normal": -1
 }

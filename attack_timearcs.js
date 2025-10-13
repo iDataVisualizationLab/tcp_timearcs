@@ -5,7 +5,6 @@
 
 (function () {
   const fileInput = document.getElementById('fileInput');
-  const eventTypeInput = document.getElementById('eventTypeInput');
   const ipMapInput = document.getElementById('ipMapInput');
   const statusEl = document.getElementById('status');
   const svg = d3.select('#chart');
@@ -76,27 +75,70 @@
       const text = await file.text();
       const rows = d3.csvParse(text.trim());
       lastRawCsvRows = rows; // cache raw rows
+      
+      console.log('Processing CSV with IP map status:', { 
+        ipMapLoaded, 
+        ipMapSize: ipIdToAddr ? ipIdToAddr.size : 0 
+      });
+      
+      // Warn if IP map is not loaded
+      if (!ipMapLoaded || !ipIdToAddr || ipIdToAddr.size === 0) {
+        console.warn('IP map not loaded or empty. Some IP IDs may not be mapped correctly.');
+        status('Warning: IP map not loaded. Some data may be filtered out.');
+      }
+      
       const data = rows.map((d, i) => {
         const attackName = decodeAttack(d.attack);
         const attackGroupName = decodeAttackGroup(d.attack_group, d.attack);
+        const srcIp = decodeIp(d.src_ip);
+        const dstIp = decodeIp(d.dst_ip);
         return {
           idx: i,
           timestamp: toNumber(d.timestamp),
           length: toNumber(d.length),
-          src_ip: decodeIp(d.src_ip),
-          dst_ip: decodeIp(d.dst_ip),
+          src_ip: srcIp,
+          dst_ip: dstIp,
           protocol: (d.protocol || '').toUpperCase() || 'OTHER',
           count: toNumber(d.count) || 1,
           attack: attackName,
           attack_group: attackGroupName,
         };
-      }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
+      }).filter(d => {
+        // Filter out records with invalid data
+        const hasValidTimestamp = isFinite(d.timestamp);
+        const hasValidSrcIp = d.src_ip && d.src_ip !== 'N/A' && !d.src_ip.startsWith('IP_');
+        const hasValidDstIp = d.dst_ip && d.dst_ip !== 'N/A' && !d.dst_ip.startsWith('IP_');
+        
+        // Debug logging for filtered records
+        if (!hasValidSrcIp || !hasValidDstIp) {
+          console.log('Filtering out record:', { 
+            src_ip: d.src_ip, 
+            dst_ip: d.dst_ip, 
+            hasValidSrcIp, 
+            hasValidDstIp,
+            ipMapLoaded,
+            ipMapSize: ipIdToAddr ? ipIdToAddr.size : 0
+          });
+        }
+        
+        return hasValidTimestamp && hasValidSrcIp && hasValidDstIp;
+      });
 
       if (data.length === 0) {
-        status('No valid rows found. Ensure CSV has required columns.');
+        status('No valid rows found. Ensure CSV has required columns and IP mappings are available.');
         clearChart();
         return;
       }
+      
+      // Report how many rows were filtered out
+      const totalRows = rows.length;
+      const filteredRows = totalRows - data.length;
+      if (filteredRows > 0) {
+        status(`Loaded ${data.length} valid rows (${filteredRows} rows filtered due to missing IP mappings)`);
+      } else {
+        status(`Loaded ${data.length} records`);
+      }
+      
       render(data);
     } catch (err) {
       console.error(err);
@@ -105,49 +147,6 @@
     }
   });
 
-  // Allow user to upload a custom event_type_mapping JSON to override default mapping
-  eventTypeInput?.addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    status(`Loading event type map ${file.name} …`);
-    try {
-      const text = await file.text();
-      const obj = JSON.parse(text);
-      // Expect format name -> id OR id -> name. Detect by sampling a few keys.
-      const entries = Object.entries(obj);
-      const rev = new Map();
-      if (entries.length) {
-        // Heuristic: if value is number, we assume name->id and reverse; else if key is numeric, we assume id->name.
-        let nameToIdMode = 0, idToNameMode = 0;
-        for (const [k, v] of entries.slice(0, 10)) {
-          if (typeof v === 'number') nameToIdMode++;
-          if (!isNaN(+k) && typeof v === 'string') idToNameMode++;
-        }
-        if (nameToIdMode >= idToNameMode) {
-          for (const [name, id] of entries) {
-            const num = Number(id);
-            if (Number.isFinite(num)) rev.set(num, name);
-          }
-        } else {
-          for (const [idStr, name] of entries) {
-            const num = Number(idStr);
-            if (Number.isFinite(num) && typeof name === 'string') rev.set(num, name);
-          }
-        }
-      }
-      attackIdToName = rev;
-      status(`Custom event type map loaded (${rev.size} entries). Re-rendering…`);
-      // If a dataset was already rendered, we need to re-decode attacks and re-render.
-      // Easier: trigger reload of default CSV if present, else wait for user CSV.
-      // We'll look for currently loaded arcs' underlying data isn't stored; keep a cached last CSV rows.
-      if (lastRawCsvRows) {
-        render(rebuildDataFromRawRows(lastRawCsvRows));
-      }
-    } catch (err) {
-      console.error(err);
-      status('Failed to parse event type JSON.');
-    }
-  });
 
   // Allow user to upload a custom ip_map JSON (expected format: { "1.2.3.4": 123, ... } OR reverse { "123": "1.2.3.4" })
   ipMapInput?.addEventListener('change', async (e) => {
@@ -180,6 +179,8 @@
       }
       ipIdToAddr = rev;
       ipMapLoaded = true;
+      console.log(`Custom IP map loaded with ${rev.size} entries`);
+      console.log('Sample entries:', Array.from(rev.entries()).slice(0, 5));
       status(`Custom IP map loaded (${rev.size} entries). Re-rendering…`);
       if (lastRawCsvRows) {
         // rebuild to decode IP ids again
@@ -209,7 +210,13 @@
         attack: attackName,
         attack_group: attackGroupName,
       };
-    }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
+    }).filter(d => {
+      // Filter out records with invalid data
+      const hasValidTimestamp = isFinite(d.timestamp);
+      const hasValidSrcIp = d.src_ip && d.src_ip !== 'N/A' && !d.src_ip.startsWith('IP_');
+      const hasValidDstIp = d.dst_ip && d.dst_ip !== 'N/A' && !d.dst_ip.startsWith('IP_');
+      return hasValidTimestamp && hasValidSrcIp && hasValidDstIp;
+    });
   }
 
   async function tryLoadDefaultCsv() {
@@ -234,10 +241,28 @@
           attack: attackName,
           attack_group: attackGroupName,
         };
-      }).filter(d => isFinite(d.timestamp) && d.src_ip && d.dst_ip);
+      }).filter(d => {
+        // Filter out records with invalid data
+        const hasValidTimestamp = isFinite(d.timestamp);
+        const hasValidSrcIp = d.src_ip && d.src_ip !== 'N/A' && !d.src_ip.startsWith('IP_');
+        const hasValidDstIp = d.dst_ip && d.dst_ip !== 'N/A' && !d.dst_ip.startsWith('IP_');
+        return hasValidTimestamp && hasValidSrcIp && hasValidDstIp;
+      });
 
-      if (!data.length) return;
-      status(`Loaded default: 90min_day1_attacks.csv (${data.length} rows)`);
+      if (!data.length) {
+        status('Default CSV loaded but no valid rows found. Check IP mappings.');
+        return;
+      }
+      
+      // Report how many rows were filtered out
+      const totalRows = rows.length;
+      const filteredRows = totalRows - data.length;
+      if (filteredRows > 0) {
+        status(`Loaded default: 90min_day1_attacks.csv (${data.length} valid rows, ${filteredRows} filtered due to missing IP mappings)`);
+      } else {
+        status(`Loaded default: 90min_day1_attacks.csv (${data.length} rows)`);
+      }
+      
       render(data);
     } catch (err) {
       // ignore if file isn't present; keep waiting for upload
@@ -279,16 +304,65 @@
     // Determine timestamp handling
     const tsMin = d3.min(data, d => d.timestamp);
     const tsMax = d3.max(data, d => d.timestamp);
+    // Check if timestamps are in milliseconds (very large numbers) or minutes
+    const looksLikeMilliseconds = tsMin > 1e12; // heuristic: milliseconds since epoch
     const looksAbsolute = tsMin > 1e6; // heuristic: minutes since epoch
     const base = looksAbsolute ? 0 : tsMin; // for relative minutes, normalize to 0
+    
+    console.log('Timestamp debug:', {
+      tsMin,
+      tsMax,
+      looksLikeMilliseconds,
+      looksAbsolute,
+      base,
+      sampleTimestamps: data.slice(0, 5).map(d => d.timestamp)
+    });
 
-    const toDate = (m) => new Date((looksAbsolute ? m : (m - base)) * 60_000);
+    const toDate = (m) => {
+      if (m === undefined || m === null || !isFinite(m)) {
+        console.warn('Invalid timestamp in toDate:', m);
+        return new Date(0); // Return epoch as fallback
+      }
+      
+      let result;
+      if (looksLikeMilliseconds) {
+        // Timestamp is already in milliseconds
+        result = new Date(m);
+      } else if (looksAbsolute) {
+        // Timestamp is in minutes since epoch
+        result = new Date(m * 60_000);
+      } else {
+        // Timestamp is relative minutes
+        result = new Date((m - base) * 60_000);
+      }
+      
+      if (!isFinite(result.getTime())) {
+        console.warn('Invalid date result in toDate:', { 
+          m, 
+          looksLikeMilliseconds, 
+          looksAbsolute, 
+          base, 
+          result 
+        });
+        return new Date(0); // Return epoch as fallback
+      }
+      return result;
+    };
 
     // Aggregate links; then order IPs using the React component's approach:
     // primary-attack grouping, groups ordered by earliest time, nodes within group by force-simulated y
     const links = computeLinks(data); // aggregated per pair per minute
     const nodes = computeNodesByAttackGrouping(links);
     const ips = nodes.map(n => n.name);
+    
+    console.log('Render debug:', {
+      dataLength: data.length,
+      linksLength: links.length,
+      nodesLength: nodes.length,
+      ipsLength: ips.length,
+      sampleIps: ips.slice(0, 5),
+      sampleLinks: links.slice(0, 3)
+    });
   // Determine which label dimension we use (attack vs group) for legend and coloring
   const activeLabelKey = labelMode === 'attack_group' ? 'attack_group' : 'attack';
   const attacks = Array.from(new Set(links.map(l => l[activeLabelKey] || 'normal'))).sort();
@@ -300,14 +374,32 @@
     height = margin.top + innerHeight + margin.bottom;
     svg.attr('width', width).attr('height', height);
 
+    const xMinDate = toDate(tsMin);
+    const xMaxDate = toDate(tsMax);
+    
+    console.log('X-scale debug:', {
+      tsMin,
+      tsMax,
+      xMinDate,
+      xMaxDate,
+      xMinValid: isFinite(xMinDate.getTime()),
+      xMaxValid: isFinite(xMaxDate.getTime())
+    });
+    
     const x = d3.scaleTime()
-      .domain([toDate(tsMin), toDate(tsMax)])
+      .domain([xMinDate, xMaxDate])
       .range([margin.left, width - margin.right]);
 
     const y = d3.scalePoint()
       .domain(ips)
       .range([margin.top, margin.top + innerHeight])
       .padding(0.5);
+    
+    console.log('Y-scale debug:', {
+      domain: ips,
+      domainLength: ips.length,
+      sampleYValues: ips.slice(0, 5).map(ip => ({ ip, y: y(ip) }))
+    });
 
     // Compute a right-side padding so the largest arc does not get clipped.
     // The horizontal reach of an arc equals its radius = |y2 - y1|/2.
@@ -391,6 +483,11 @@
 
     // Arc path generator between two points sharing same x
     function verticalArcPath(xp, y1, y2) {
+      // Validate inputs to prevent undefined values in SVG path
+      if (xp === undefined || y1 === undefined || y2 === undefined) {
+        console.warn('Invalid arc path parameters:', { xp, y1, y2 });
+        return 'M0,0 L0,0'; // Return a minimal valid path
+      }
       const yTop = Math.min(y1, y2);
       const yBot = Math.max(y1, y2);
       const dr = Math.max(1, (yBot - yTop) / 2);
@@ -410,9 +507,39 @@
   .attr('stroke', d => colorForAttack((labelMode==='attack_group'? d.attack_group : d.attack) || 'normal'))
       .attr('stroke-width', d => widthScale(Math.max(1, d.count)))
       .attr('d', d => {
-        const xp = x(toDate(d.minute));
+        const dateFromMinute = toDate(d.minute);
+        const xp = x(dateFromMinute);
         const y1 = y(d.source);
         const y2 = y(d.target);
+        
+        // Validate that x-scale returned valid values
+        if (xp === undefined || !isFinite(xp)) {
+          console.warn('Invalid x-coordinate for arc:', { 
+            minute: d.minute,
+            dateFromMinute,
+            xp,
+            xDomain: [xMinDate, xMaxDate],
+            xRange: [margin.left, width - margin.right]
+          });
+          return 'M0,0 L0,0'; // Return minimal valid path
+        }
+        
+        // Validate that y-scale returned valid values
+        if (y1 === undefined || y2 === undefined) {
+          console.warn('Invalid y-coordinates for arc:', { 
+            source: d.source, 
+            target: d.target, 
+            y1, 
+            y2,
+            xp,
+            minute: d.minute,
+            yDomain: ips,
+            sourceInDomain: ips.includes(d.source),
+            targetInDomain: ips.includes(d.target)
+          });
+          return 'M0,0 L0,0'; // Return minimal valid path
+        }
+        
         return verticalArcPath(xp, y1, y2);
       })
       .on('mouseover', function (event, d) {
@@ -717,6 +844,9 @@
     if (Number.isFinite(n) && ipIdToAddr) {
       const ip = ipIdToAddr.get(n);
       if (ip) return ip;
+      // If IP ID not found in map, log it and return a placeholder
+      console.warn(`IP ID ${n} not found in mapping. Available IDs: ${ipIdToAddr ? ipIdToAddr.size : 0} entries`);
+      return `IP_${n}`;
     }
     return v; // fallback to original string
   }
