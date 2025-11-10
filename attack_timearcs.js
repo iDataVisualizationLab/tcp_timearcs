@@ -13,6 +13,9 @@
   const legendEl = document.getElementById('legend');
   const tooltip = document.getElementById('tooltip');
   const labelModeRadios = document.querySelectorAll('input[name="labelMode"]');
+  const lensingMulSlider = document.getElementById('lensingMulSlider');
+  const lensingMulValue = document.getElementById('lensingMulValue');
+  const lensingToggleBtn = document.getElementById('lensingToggle');
 
   // User-selected labeling mode: 'attack' or 'attack_group'
   let labelMode = 'attack';
@@ -24,9 +27,62 @@
     }
   }));
 
+  // Handle lens magnification slider
+  if (lensingMulSlider && lensingMulValue) {
+    lensingMulSlider.addEventListener('input', (e) => {
+      lensingMul = parseFloat(e.target.value);
+      lensingMulValue.textContent = `${lensingMul}x`;
+      // If lensing is active, update visualization immediately
+      if (isLensing && updateLensVisualizationFn) {
+        updateLensVisualizationFn();
+      }
+    });
+  }
+
+  // Handle lens toggle button
+  function updateLensingButtonState() {
+    if (!lensingToggleBtn) return;
+    if (isLensing) {
+      lensingToggleBtn.style.background = '#007bff';
+      lensingToggleBtn.style.color = '#fff';
+      lensingToggleBtn.style.borderColor = '#007bff';
+    } else {
+      lensingToggleBtn.style.background = '#fff';
+      lensingToggleBtn.style.color = '#000';
+      lensingToggleBtn.style.borderColor = '#dee2e6';
+    }
+  }
+
+  if (lensingToggleBtn) {
+    lensingToggleBtn.addEventListener('click', () => {
+      if (toggleLensingFn) {
+        toggleLensingFn();
+        updateLensingButtonState();
+      }
+    });
+  }
+
+  // Handle keyboard shortcut: Shift + L to toggle lensing
+  document.addEventListener('keydown', (e) => {
+    // Check for Shift + L (case insensitive)
+    if (e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+      e.preventDefault(); // Prevent default browser behavior
+      if (toggleLensingFn) {
+        toggleLensingFn();
+        updateLensingButtonState();
+      }
+    }
+  });
+
   const margin = { top: 40, right: 20, bottom: 30, left: 110 };
   let width = 1200; // updated on render
   let height = 600; // updated on render
+
+  // Lens magnification state
+  let isLensing = false;
+  let lensingMul = 5; // Magnification factor (5x)
+  let lensCenter = 0; // Focused timestamp position
+  let XGAP_BASE = null; // Base X-scale gap for lens calculations
 
   // Default protocol colors
   const protocolColors = new Map([
@@ -56,6 +112,11 @@
   let visibleAttacks = new Set(); // Set of attack names that are currently visible
   let currentArcPaths = null; // Reference to arc paths selection for visibility updates
   let currentLabelMode = 'attack'; // Track current label mode for filtering
+  
+  // Reference to updateLensVisualization function so slider can trigger updates
+  let updateLensVisualizationFn = null;
+  // Reference to toggleLensing function so button can trigger it
+  let toggleLensingFn = null;
 
   // Initialize mappings, then try a default CSV load
   (async function init() {
@@ -788,6 +849,59 @@
       .domain([xMinDate, xMaxDate])
       .range([margin.left + 8, margin.left + 8 + timelineWidth]);
 
+    // Calculate base gap for lens calculations
+    XGAP_BASE = timelineWidth / (tsMax - tsMin);
+
+    // Initialize lens center to middle of data range
+    if (lensCenter === 0 || lensCenter < tsMin || lensCenter > tsMax) {
+      lensCenter = (tsMin + tsMax) / 2;
+    }
+
+    // Lens-aware x scale function
+    function xScaleLens(timestamp) {
+      if (!isLensing) {
+        return x(toDate(timestamp));
+      }
+
+      // Safety check for zero range
+      if (tsMax === tsMin) {
+        return x(toDate(timestamp));
+      }
+
+      // Convert timestamp to normalized position (0 to 1)
+      const normalized = (timestamp - tsMin) / (tsMax - tsMin);
+      const totalWidth = timelineWidth;
+
+      // Lens parameters
+      const numLens = 0.1; // 10% of range on each side
+      const lensNormalized = (lensCenter - tsMin) / (tsMax - tsMin);
+      const lensStart = Math.max(0, lensNormalized - numLens);
+      const lensEnd = Math.min(1, lensNormalized + numLens);
+
+      // Calculate compressed width
+      const lensWidth = lensEnd - lensStart;
+      const outsideWidth = 1 - lensWidth;
+      const compressedOutside = outsideWidth / (1 + lensWidth * (lensingMul - 1));
+      const expandedLens = lensWidth * lensingMul * compressedOutside;
+
+      let position;
+      if (normalized < lensStart) {
+        // Before lens: compressed
+        position = lensStart > 0 ? normalized * (compressedOutside / lensStart) : 0;
+      } else if (normalized > lensEnd) {
+        // After lens: compressed
+        const denominator = 1 - lensEnd;
+        position = compressedOutside + expandedLens +
+                   (denominator > 0 ? (normalized - lensEnd) * (compressedOutside / denominator) : 0);
+      } else {
+        // Inside lens: expanded
+        position = compressedOutside +
+                   (lensWidth > 0 ? (normalized - lensStart) * (expandedLens / lensWidth) : 0);
+      }
+
+      return margin.left + 8 + position * totalWidth;
+    }
+
     // Use allIps for the y scale to ensure all IPs referenced in arcs are included
     const y = d3.scalePoint()
       .domain(allIps)
@@ -912,8 +1026,8 @@
       .join('linearGradient')
       .attr('id', d => gradIdForLink(d))
       .attr('gradientUnits', 'userSpaceOnUse')
-      .attr('x1', d => x(toDate(d.minute)))
-      .attr('x2', d => x(toDate(d.minute)))
+      .attr('x1', d => xScaleLens(d.minute))
+      .attr('x2', d => xScaleLens(d.minute))
       .attr('y1', d => y(d.source))
       .attr('y2', d => y(d.target));
 
@@ -939,16 +1053,14 @@
       .attr('stroke', d => `url(#${gradIdForLink(d)})`)
       .attr('stroke-width', d => widthScale(Math.max(1, d.count)))
       .attr('d', d => {
-        const dateFromMinute = toDate(d.minute);
-        const xp = x(dateFromMinute);
+        const xp = xScaleLens(d.minute);
         const y1 = y(d.source);
         const y2 = y(d.target);
-        
+
         // Validate that x-scale returned valid values
         if (xp === undefined || !isFinite(xp)) {
-          console.warn('Invalid x-coordinate for arc:', { 
+          console.warn('Invalid x-coordinate for arc:', {
             minute: d.minute,
-            dateFromMinute,
             xp,
             xDomain: [xMinDate, xMaxDate],
             xRange: [margin.left, width - margin.right]
@@ -1005,7 +1117,7 @@
           .style('pointer-events', 'none');
 
         // Move the two endpoint labels close to the hovered link's time and align to arc ends
-        const xp = x(toDate(d.minute));
+        const xp = xScaleLens(d.minute);
         svg.selectAll('.ip-label')
           .filter(s => active.has(s))
           .transition()
@@ -1331,7 +1443,7 @@
     // Animate arcs with proper interpolation to final positions
     arcPaths.transition().duration(1200)
       .attrTween('d', function(d) {
-        const xp = x(toDate(d.minute));
+        const xp = xScaleLens(d.minute);
         // Start at current scale positions; end at finalY
         const y1Start = y(d.source);
         const y2Start = y(d.target);
@@ -1348,7 +1460,7 @@
       })
       .on('end', (d, i) => {
         // Update gradient to final positions so grey->attack aligns with endpoints
-        const xp = x(toDate(d.minute));
+        const xp = xScaleLens(d.minute);
         const y1f = finalY(d.source);
         const y2f = finalY(d.target);
         svg.select(`#${gradIdForLink(d)}`)
@@ -1362,14 +1474,197 @@
            .range(finalY.range())
            .padding(0.5);
           arcPaths.attr('d', dd => {
-            const xp2 = x(toDate(dd.minute));
+            const xp2 = xScaleLens(dd.minute);
             const a = y(dd.source);
             const b = y(dd.target);
             return (isFinite(xp2) && isFinite(a) && isFinite(b)) ? verticalArcPath(xp2, a, b) : 'M0,0 L0,0';
           });
           status(`${data.length} records • ${sortedIps.length} IPs • ${attacks.length} ${labelMode==='attack_group' ? 'attack groups' : 'attack types'}`);
+
+          // Trigger auto-fit after initial animation completes
+          setTimeout(() => autoFitArcs(), 100);
         }
       });
+
+    // Auto-fit arcs function: adaptively space IPs to fit in viewport
+    function autoFitArcs() {
+      console.log('Auto-fit called, IPs:', sortedIps.length);
+
+      // Collect current Y positions from sorted IPs
+      const ipPositions = sortedIps.map((ip, idx) => ({
+        ip: ip,
+        y: finalY(ip),
+        idx: idx
+      }));
+
+      // Calculate adaptive step to fit all IPs in viewport
+      const availableHeight = height - margin.top - margin.bottom - 25;
+      const numIps = sortedIps.length;
+      const adaptiveStep = Math.min(availableHeight / (numIps + 1), 20); // Cap at 20px max
+      console.log('Adaptive step:', adaptiveStep, 'Available height:', availableHeight);
+
+      // Create new Y scale with adaptive spacing
+      const autoFitY = d3.scalePoint()
+        .domain(sortedIps)
+        .range([margin.top + 12, margin.top + 12 + (numIps * adaptiveStep)])
+        .padding(0.5);
+
+      // Animate to new positions
+      // Update lines
+      rows.selectAll('line')
+        .transition().duration(800)
+        .tween('y-line', function(d) {
+          const yStart = finalY(d.ip);
+          const yEnd = autoFitY(d.ip);
+          const interp = d3.interpolateNumber(yStart, yEnd);
+          const self = d3.select(this);
+          return function(t) {
+            const yy = interp(t);
+            self.attr('y1', yy).attr('y2', yy);
+          };
+        });
+
+      // Update labels
+      rows.selectAll('text')
+        .transition().duration(800)
+        .tween('y-text', function(d) {
+          const yStart = finalY(d);
+          const yEnd = autoFitY(d);
+          const interp = d3.interpolateNumber(yStart, yEnd);
+          const self = d3.select(this);
+          return function(t) { self.attr('y', interp(t)); };
+        });
+
+      // Update arcs
+      arcPaths.transition().duration(800)
+        .attrTween('d', function(d) {
+          const xp = xScaleLens(d.minute);
+          const y1Start = finalY(d.source);
+          const y2Start = finalY(d.target);
+          const y1End = autoFitY(d.source);
+          const y2End = autoFitY(d.target);
+          return function(t) {
+            const y1t = y1Start + (y1End - y1Start) * t;
+            const y2t = y2Start + (y2End - y2Start) * t;
+            return verticalArcPath(xp, y1t, y2t);
+          };
+        })
+        .on('end', () => {
+          // Update working scale
+          y.domain(sortedIps).range(autoFitY.range());
+          finalY.domain(sortedIps).range(autoFitY.range());
+          status(`Auto-fit: ${numIps} IPs with ${adaptiveStep.toFixed(1)}px spacing`);
+        });
+
+      // Update gradients
+      links.forEach(d => {
+        const xp = xScaleLens(d.minute);
+        svg.select(`#${gradIdForLink(d)}`)
+          .transition().duration(800)
+          .attr('y1', autoFitY(d.source))
+          .attr('y2', autoFitY(d.target));
+      });
+    }
+
+    // Toggle lens magnification
+    function toggleLensing() {
+      isLensing = !isLensing;
+      console.log('Lens toggled:', isLensing, 'Center:', lensCenter);
+
+      if (isLensing) {
+        // Add invisible overlay for mouse tracking - covers entire SVG
+        svg.append('rect')
+          .attr('class', 'lens-overlay')
+          .attr('x', 0)
+          .attr('y', 0)
+          .attr('width', width)
+          .attr('height', height)
+          .style('fill', 'none')
+          .style('pointer-events', 'all')
+          .style('cursor', 'crosshair')
+          .on('mousemove', function(event) {
+            const [mx, my] = d3.pointer(event);
+            // Clamp mouse position to timeline area
+            const clampedX = Math.max(margin.left + 8, Math.min(mx, margin.left + 8 + timelineWidth));
+            // Convert mouse X to timestamp
+            lensCenter = tsMin + ((clampedX - margin.left - 8) / timelineWidth) * (tsMax - tsMin);
+            updateLensVisualization();
+          });
+      } else {
+        // Remove overlay when lens is disabled
+        svg.select('.lens-overlay').remove();
+        // Note: We don't call updateLensVisualization() here to keep the current magnified state frozen
+      }
+    }
+    
+    // Store reference to toggleLensing so button can trigger it
+    toggleLensingFn = toggleLensing;
+
+    // Update visualization with current lens state
+    function updateLensVisualization() {
+      console.log('Updating lens visualization, isLensing:', isLensing, 'arcPaths:', arcPaths ? arcPaths.size() : 0);
+
+      // Animate arcs to new positions
+      arcPaths.transition().duration(250)
+        .attr('d', d => {
+          const xp = xScaleLens(d.minute);
+          const y1 = y(d.source);
+          const y2 = y(d.target);
+          return verticalArcPath(xp, y1, y2);
+        });
+
+      // Update gradients
+      links.forEach(d => {
+        const xp = xScaleLens(d.minute);
+        svg.select(`#${gradIdForLink(d)}`)
+          .transition().duration(250)
+          .attr('x1', xp)
+          .attr('x2', xp);
+      });
+
+      // Update row lines
+      rows.selectAll('line')
+        .transition().duration(250)
+        .attr('x1', d => d.span ? xScaleLens(d.span.min) : margin.left)
+        .attr('x2', d => d.span ? xScaleLens(d.span.max) : margin.left);
+
+      // Update axis to follow lens transformation
+      const axisSvg = d3.select('#axis-top');
+      const axisGroup = axisSvg.select('g');
+
+      // Create a temporary scale to get tick values
+      const tempScale = d3.scaleTime()
+        .domain([xMinDate, xMaxDate])
+        .range([0, timelineWidth]);
+
+      const tickValues = tempScale.ticks(7);
+
+      // Update tick positions based on lens
+      axisGroup.selectAll('.tick')
+        .data(tickValues)
+        .transition().duration(250)
+        .attr('transform', function(d) {
+          // d is a Date object
+          // Convert to timestamp in the data's unit
+          let timestamp;
+          if (looksAbsolute) {
+            if (unit === 'microseconds') timestamp = d.getTime() * 1000;
+            else if (unit === 'milliseconds') timestamp = d.getTime();
+            else if (unit === 'seconds') timestamp = d.getTime() / 1000;
+            else if (unit === 'minutes') timestamp = d.getTime() / 60000;
+            else timestamp = d.getTime() / 3600000; // hours
+          } else {
+            timestamp = (d.getTime() / unitMs) + base;
+          }
+
+          // Calculate new position using lens
+          const newX = xScaleLens(timestamp) - (margin.left + 8);
+          return `translate(${newX},0)`;
+        });
+    }
+    
+    // Store reference to updateLensVisualization so slider can trigger updates
+    updateLensVisualizationFn = updateLensVisualization;
   }
 
   function showTooltip(evt, html) {
