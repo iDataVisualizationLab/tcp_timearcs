@@ -38,7 +38,8 @@
       border: 1px solid #e9ecef;
       border-radius: 6px;
       padding: 8px;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
       min-height: 400px;
     }
     .row-line { stroke: #e9ecef; stroke-width: 1; }
@@ -61,10 +62,12 @@
 <body>
   <header>
     <div class="controls">
-      <label for="fileInput" style="font-weight:600;">Upload CSV</label>
-      <input id="fileInput" type="file" accept=".csv" />
+      <label for="fileInput" style="font-weight:600;">Upload CSV(s)</label>
+      <input id="fileInput" type="file" accept=".csv" multiple />
       <label for="ipMapInput" style="font-weight:600;">IP Map JSON</label>
       <input id="ipMapInput" type="file" accept=".json" />
+      <label for="eventMapInput" style="font-weight:600;">Event Type Map JSON</label>
+      <input id="eventMapInput" type="file" accept=".json" />
       <fieldset style="border:1px solid #dee2e6; padding:4px 8px; border-radius:4px; display:flex; gap:8px; align-items:center;">
         <legend style="font-size:12px; padding:0 4px; font-weight:600;">Label Mode</legend>
         <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
@@ -76,6 +79,9 @@
           <span>Attack Group</span>
         </label>
       </fieldset>
+      <button id="lensingToggle" style="padding:6px 12px; border:1px solid #dee2e6; border-radius:4px; background:#fff; cursor:pointer; font-size:12px; font-weight:600; transition: all 0.2s;">
+        <span>🔍 Lensing</span>
+      </button>
     </div>
     <div class="hint">Columns: timestamp,length,src_ip,dst_ip,protocol,count,attack • Default load: 90min_day1_attacks.csv</div>
     <div id="status">Waiting for data…</div>

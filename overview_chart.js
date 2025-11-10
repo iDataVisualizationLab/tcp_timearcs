@@ -23,6 +23,7 @@ let hiddenInvalidReasonsRef = null;
 let hiddenCloseTypesRef = null;
 let applyInvalidReasonFilterRef = null; // callback from main to hide/show dots/arcs
 let createFlowListRef = null; // callback to populate flow list
+let loadPacketBinRef = null; // optional: load packets for a given bin index
 
 // Config shared with main (imported)
 let flagColors = {};
@@ -44,6 +45,7 @@ export function initOverview(options) {
     hiddenCloseTypesRef = options.hiddenCloseTypes;
     applyInvalidReasonFilterRef = options.applyInvalidReasonFilter;
     createFlowListRef = options.createFlowList;
+    loadPacketBinRef = options.loadPacketBin;
     // Bin count is centralized in config.js; ignore per-call overrides
     flagColors = options.flagColors || {};
     flowColors = options.flowColors || {};
@@ -448,6 +450,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
         .on('click', (event, d) => {
             // Populate flow list with the flows represented by this specific segment
             try {
+                if (typeof loadPacketBinRef === 'function') {
+                    try { loadPacketBinRef(d.binIndex); } catch (_) {}
+                }
                 const segFlows = Array.isArray(d.flows) ? d.flows : [];
                 if (typeof createFlowListRef === 'function') {
                     createFlowListRef(segFlows);
@@ -527,6 +532,9 @@ export function createOverviewChart(packets, { timeExtent, width, margins }) {
                     try {
                         const band = lastBandByBin.get(i) || 'invalid';
                         const flows = (d && d.flows && Array.isArray(d.flows[band])) ? d.flows[band] : [];
+                        if (typeof loadPacketBinRef === 'function') {
+                            try { loadPacketBinRef(i); } catch (_) {}
+                        }
                         if (typeof createFlowListRef === 'function') {
                             createFlowListRef(flows);
                         }

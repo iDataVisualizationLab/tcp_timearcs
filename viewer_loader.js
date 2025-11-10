@@ -1,7 +1,8 @@
-// Simple visualization loader
-// This file loads the unified bar diagram module which handles both arc and bar views internally
+// Enhanced visualization loader with folder support
+// This file loads the unified bar diagram module and folder integration
 
 let visualizationModule = null;
+let folderIntegrationModule = null;
 
 async function loadVisualizationModule() {
     try {
@@ -16,6 +17,16 @@ async function loadVisualizationModule() {
         if (visualizationModule.init) {
             visualizationModule.init();
         }
+        
+        // Load folder integration module
+        console.log('Loading folder integration module...');
+        folderIntegrationModule = await import('./folder_integration.js');
+        
+        if (folderIntegrationModule.initFolderIntegration) {
+            folderIntegrationModule.initFolderIntegration();
+        }
+        
+        console.log('Successfully loaded folder integration');
         
     } catch (error) {
         console.error('Failed to load visualization module:', error);
@@ -34,4 +45,4 @@ if (document.readyState === 'loading') {
 }
 
 // Export for potential use by other modules
-export { loadVisualizationModule };
+export { loadVisualizationModule, visualizationModule, folderIntegrationModule };

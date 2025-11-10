@@ -3594,11 +3594,101 @@ function init() {
         dataFileInput.addEventListener('change', handleFileLoad);
     }
     
+    // Add folder data listener
+    document.addEventListener('folderDataLoaded', handleFolderDataLoaded);
+    
     // Initialize the visualization
     initializeBarVisualization();
     
     // Load ground truth data in the background
     loadGroundTruthData();
+}
+
+// Handle folder data loaded event
+function handleFolderDataLoaded(event) {
+    console.log('Folder data loaded event received:', event.detail);
+    
+    try {
+        const { packets, flowsIndex, ipStats, flagStats, manifest } = event.detail;
+        
+        if (!packets || packets.length === 0) {
+            console.error('No packets in folder data');
+            alert('Error: No packets found in folder data');
+            return;
+        }
+        
+        console.log(`Processing ${packets.length} packets from folder...`);
+        
+        // Set data
+        fullData = packets;
+        filteredData = [];
+        
+        // Convert flows index to flow objects (simplified format for now)
+        tcpFlows = flowsIndex.map(flowSummary => ({
+            id: flowSummary.id,
+            key: flowSummary.key,
+            initiator: flowSummary.initiator,
+            responder: flowSummary.responder,
+            initiatorPort: flowSummary.initiatorPort,
+            responderPort: flowSummary.responderPort,
+            state: flowSummary.state,
+            closeType: flowSummary.closeType,
+            startTime: flowSummary.startTime,
+            endTime: flowSummary.endTime,
+            totalPackets: flowSummary.totalPackets,
+            totalBytes: flowSummary.totalBytes,
+            establishmentComplete: flowSummary.establishmentComplete,
+            dataTransferStarted: flowSummary.dataTransferStarted,
+            closingStarted: flowSummary.closingStarted,
+            invalidReason: flowSummary.invalidReason,
+            ongoing: flowSummary.ongoing,
+            phases: {
+                establishment: Array(flowSummary.establishment_packets || 0).fill({}),
+                dataTransfer: Array(flowSummary.data_transfer_packets || 0).fill({}),
+                closing: Array(flowSummary.closing_packets || 0).fill({})
+            }
+        }));
+        
+        console.log(`Loaded ${tcpFlows.length} flows from folder`);
+        
+        // Initialize currentFlows as empty - will be populated when IPs are selected
+        currentFlows = [];
+        selectedFlowIds.clear();
+        
+        // Update TCP flow stats to show initial message
+        updateTcpFlowStats(currentFlows);
+        
+        // Extract unique IPs from packet data
+        const uniqueIPs = Array.from(new Set(fullData.flatMap(p => [p.src_ip, p.dst_ip]))).filter(Boolean);
+        createIPCheckboxes(uniqueIPs);
+        
+        // Initialize web worker for packet filtering
+        try {
+            initPacketWorker();
+            // Assign stable index for each packet
+            packets.forEach((p, i) => p._packetIndex = i);
+            if (packetWorker) {
+                packetWorkerReady = false;
+                packetWorker.postMessage({ type: 'init', packets });
+            }
+        } catch (err) {
+            console.error('Worker init failed', err);
+        }
+        
+        // Show message asking user to select IPs
+        document.getElementById('loadingMessage').textContent = 'Please select 2 or more IP addresses to view connections.';
+        document.getElementById('loadingMessage').style.display = 'block';
+        
+        console.log(`Folder data ready with ${packets.length} packets and ${uniqueIPs.length} unique IPs`);
+        
+        // Hide progress
+        try { sbHideCsvProgress(); } catch (_) {}
+        
+    } catch (err) {
+        console.error('Error handling folder data:', err);
+        alert(`Error processing folder data: ${err.message}`);
+        try { sbHideCsvProgress(); } catch (_) {}
+    }
 }
 
 // Export functions for dynamic loading

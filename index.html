@@ -440,10 +440,30 @@
       <aside id="sidebar">
         <div class="controls">
         <div class="control-group">
-            <label for="dataFile">Data File</label>
-            <input type="file" id="dataFile" accept=".csv" />
+            <label>Data Source</label>
+            <div style="border: 1px solid #dee2e6; padding: 10px; background: white; border-radius: 4px; margin-bottom: 10px;">
+                <div style="margin-bottom: 10px;">
+                    <label style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <input type="radio" name="dataSource" id="dataSourceCSV" value="csv" checked style="margin-right: 8px;">
+                        Single CSV File
+                    </label>
+                    <label style="display: flex; align-items: center;">
+                        <input type="radio" name="dataSource" id="dataSourceFolder" value="folder" style="margin-right: 8px;">
+                        Folder (Split Files)
+                    </label>
+                </div>
+                <div id="csvSourceSection">
+                    <input type="file" id="dataFile" accept=".csv" />
+                </div>
+                <div id="folderSourceSection" style="display: none;">
+                    <button id="openFolderBtn" style="padding: 8px 12px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        📁 Open Folder
+                    </button>
+                    <div id="folderInfo" style="margin-top: 8px; font-size: 11px; color: #666;"></div>
+                </div>
+            </div>
             <div id="csvProgress" style="display: none; margin-top: 8px; padding: 8px; background: #f8f9fa; border-radius: 4px; border: 1px solid #dee2e6;">
-                <div style="font-size: 11px; color: #555; margin-bottom: 4px;" id="csvProgressLabel">Loading CSV file...</div>
+                <div style="font-size: 11px; color: #555; margin-bottom: 4px;" id="csvProgressLabel">Loading data...</div>
                 <div style="width: 100%; height: 6px; background: #e9ecef; border-radius: 3px; overflow: hidden;">
                     <div id="csvProgressBar" style="width: 0%; height: 100%; background: #007bff; transition: width 0.3s ease;"></div>
                 </div>
