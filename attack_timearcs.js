@@ -496,7 +496,7 @@
   }
 
   async function tryLoadDefaultCsv() {
-    const defaultPath = './90min_day1_grouped_attacks.csv';
+    const defaultPath = './set1_first90_minutes.csv';
     try {
       const res = await fetch(defaultPath, { cache: 'no-store' });
       if (!res.ok) return; // quietly exit if not found
@@ -534,9 +534,9 @@
       const totalRows = rows.length;
       const filteredRows = totalRows - data.length;
       if (filteredRows > 0) {
-        status(`Loaded default: 90min_day1_attacks.csv (${data.length} valid rows, ${filteredRows} filtered due to missing IP mappings)`);
+        status(`Loaded default: set1_first90_minutes.csv (${data.length} valid rows, ${filteredRows} filtered due to missing IP mappings)`);
       } else {
-        status(`Loaded default: 90min_day1_attacks.csv (${data.length} rows)`);
+        status(`Loaded default: set1_first90_minutes.csv (${data.length} rows)`);
       }
       
       render(data);

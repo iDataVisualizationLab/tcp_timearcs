@@ -11,6 +11,7 @@
 !flag_colors.json
 !flow_colors.json
 !full_ip_map.json
+!set1_first90_minutes.csv
 
 
 # Ignore hidden files (dotfiles) but keep this file
