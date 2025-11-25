@@ -16,44 +16,60 @@
       padding: 12px 16px;
       background: #ffffff;
       border-bottom: 1px solid #e9ecef;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-controls {
       display: flex;
       gap: 12px;
       align-items: center;
-      position: sticky;
-      top: 0;
-      z-index: 10;
+      flex-wrap: wrap;
     }
-    main { padding: 12px 16px; }
-    .top-bar {
-      position: sticky;
-      top: 0;
-      z-index: 1000;
+    .secondary-controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 12px 16px 8px 16px;
       background: #ffffff;
       border-bottom: 1px solid #e9ecef;
-      padding: 6px 0 8px 0;
+      position: sticky;
+      top: 48px;
+      z-index: 99;
     }
-    #axis-top { display: block; width: 100%; height: 36px; }
+    main { padding: 8px 16px 12px 16px; }
+    .top-bar {
+      position: sticky;
+      top: 110px;
+      z-index: 98;
+      background: #ffffff;
+      border-bottom: 1px solid #e9ecef;
+      padding: 8px 0;
+    }
+    #axis-top { display: block; height: 36px; }
     #chart-container {
       background: #fff;
       border: 1px solid #e9ecef;
       border-radius: 6px;
       padding: 8px;
-      overflow-y: auto;
-      overflow-x: hidden;
+      overflow: auto;
       min-height: 400px;
+      margin-top: 8px;
+      position: relative;
     }
     .row-line { stroke: #e9ecef; stroke-width: 1; }
-    .ip-label { font-size: 11px; fill: #343a40; }
+    .ip-label { font-size: 8px; fill: #343a40; }
     .time-axis text { font-size: 10px; fill: #000; }
     .time-axis path, .time-axis line { stroke: #000; }
     .arc { fill: none; stroke-opacity: 0.8; pointer-events: stroke; }
     .arc:hover { stroke-opacity: 1; }
-    .legend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+    .legend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 0; }
     .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
     .swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid #dee2e6; }
     .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     .hint { color: #6c757d; font-size: 12px; }
-    #status { color: #6c757d; font-size: 12px; margin-left: auto; }
+    #status { color: #6c757d; font-size: 12px; margin-left: auto; white-space: nowrap; }
     .tooltip { position: fixed; background: rgba(0,0,0,0.85); color: #fff; padding: 8px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; z-index: 99999; }
   </style>
   <link rel="preconnect" href="https://d3js.org" />
@@ -61,48 +77,49 @@
 </head>
 <body>
   <header>
-    <div class="controls">
+    <div class="header-controls">
       <label for="fileInput" style="font-weight:600;">Upload CSV(s)</label>
       <input id="fileInput" type="file" accept=".csv" multiple />
       <label for="ipMapInput" style="font-weight:600;">IP Map JSON</label>
       <input id="ipMapInput" type="file" accept=".json" />
       <label for="eventMapInput" style="font-weight:600;">Event Type Map JSON</label>
       <input id="eventMapInput" type="file" accept=".json" />
-      <fieldset style="border:1px solid #dee2e6; padding:4px 8px; border-radius:4px; display:flex; gap:8px; align-items:center;">
-        <legend style="font-size:12px; padding:0 4px; font-weight:600;">Label Mode</legend>
-        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
-          <input type="radio" name="labelMode" value="attack" id="labelModeAttack" checked>
-          <span>Attack</span>
-        </label>
-        <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
-          <input type="radio" name="labelMode" value="attack_group" id="labelModeAttackGroup">
-          <span>Attack Group</span>
-        </label>
-      </fieldset>
-      <button id="lensingToggle" style="padding:6px 12px; border:1px solid #dee2e6; border-radius:4px; background:#fff; cursor:pointer; font-size:12px; font-weight:600; transition: all 0.2s;" title="Toggle lensing mode (Shift + L)">
-        <span>🔍 Lensing</span>
-        <span style="font-size:10px; opacity:0.7; margin-left:4px;">(⇧L)</span>
-      </button>
-      <div style="display:flex; align-items:center; gap:8px; padding:4px 8px; border:1px solid #dee2e6; border-radius:4px;">
-        <label for="lensingMulSlider" style="font-size:12px; font-weight:600; white-space:nowrap;">Zoom:</label>
-        <input type="range" id="lensingMulSlider" min="2" max="200" step="1" value="5" style="width:100px; cursor:pointer;" />
-        <span id="lensingMulValue" style="font-size:12px; min-width:24px; text-align:right;">5x</span>
-      </div>
+      <div id="status">Waiting for data…</div>
     </div>
-    <div class="hint" style="display: none;">
-      Columns: timestamp,length,src_ip,dst_ip,protocol,count,attack • Default load: 90min_day1_attacks.csv
-      <span style="margin-left:12px; padding-left:12px; border-left:1px solid #dee2e6;">
-        💡 Tip: Press <kbd style="padding:2px 6px; background:#f8f9fa; border:1px solid #dee2e6; border-radius:3px; font-size:11px; font-family:monospace;">Shift + L</kbd> to toggle lensing
-      </span>
-    </div>
-    <div id="status" style="display: none;">Waiting for data…</div>
   </header>
+  <div class="secondary-controls">
+    <fieldset style="border:1px solid #dee2e6; padding:4px 8px; border-radius:4px; display:flex; gap:8px; align-items:center;">
+      <legend style="font-size:12px; padding:0 4px; font-weight:600;">Label Mode</legend>
+      <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
+        <input type="radio" name="labelMode" value="attack" id="labelModeAttack" checked>
+        <span>Attack</span>
+      </label>
+      <label style="display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
+        <input type="radio" name="labelMode" value="attack_group" id="labelModeAttackGroup">
+        <span>Attack Group</span>
+      </label>
+    </fieldset>
+    <button id="lensingToggle" style="padding:6px 12px; border:1px solid #dee2e6; border-radius:4px; background:#fff; cursor:pointer; font-size:12px; font-weight:600; transition: all 0.2s;" title="Toggle lensing mode (Shift + L)">
+      <span>🔍 Lensing</span>
+      <span style="font-size:10px; opacity:0.7; margin-left:4px;">(⇧L)</span>
+    </button>
+    <div style="display:flex; align-items:center; gap:8px; padding:4px 8px; border:1px solid #dee2e6; border-radius:4px;">
+      <label for="lensingMulSlider" style="font-size:12px; font-weight:600; white-space:nowrap;">Zoom:</label>
+      <input type="range" id="lensingMulSlider" min="2" max="200" step="1" value="5" style="width:100px; cursor:pointer;" />
+      <span id="lensingMulValue" style="font-size:12px; min-width:24px; text-align:right;">5x</span>
+    </div>
+    <div class="hint" style="margin-left: auto;">
+      💡 Press <kbd style="padding:2px 6px; background:#f8f9fa; border:1px solid #dee2e6; border-radius:3px; font-size:11px; font-family:monospace;">Shift + L</kbd> to toggle lensing
+    </div>
+  </div>
   <main>
     <div class="top-bar">
       <div class="legend" id="legend" style="margin-bottom:6px;"></div>
-      <svg id="axis-top"></svg>
     </div>
     <div id="chart-container">
+      <div style="position: sticky; top: 0; z-index: 10; background: #fff; border-bottom: 1px solid #eee;">
+        <svg id="axis-top"></svg>
+      </div>
       <svg id="chart" width="1200" height="600" aria-label="TimeArcs chart"></svg>
     </div>
   </main>
