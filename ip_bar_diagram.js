@@ -102,6 +102,12 @@ let ipOrder = []; // Current vertical order of IPs
 // Row layout constants (used for positioning and drag-reorder)
 const ROW_GAP = 50; // vertical gap between IP rows
 const TOP_PAD = 30; // top padding before first row
+
+// Force layout for IP positioning
+let forceLayout = null;
+let forceNodes = [];
+let forceLinks = [];
+let isForceLayoutRunning = false;
 let tcpFlows = []; // Store detected TCP flows (from CSV)
 let currentFlows = []; // Flows matching current IP selection (subset of tcpFlows)
 let selectedFlowIds = new Set(); // Store IDs of selected flows as strings
@@ -1769,17 +1775,20 @@ async function updateIPFilter() {
         
         // Update ground truth statistics
         updateGroundTruthStats(selectedIPs);
-        
-        // Recreate visualization with filtered data
-        visualizeTimeArcs(filteredData);
-        // Sidebar flag stats suppressed; render flags legend in-canvas
-        try { drawFlagLegend(); } catch (_) {}
-        // Update IP statistics for the current filtered data
-        updateIPStats(filteredData);
-        // Recompute size scaling once DOM updates complete
+
+        // Compute force layout positions for IPs before visualization
+        computeForceLayoutPositions(filteredData, selectedIPs, () => {
+            // Recreate visualization with filtered data after force layout completes
+            visualizeTimeArcs(filteredData);
+            // Sidebar flag stats suppressed; render flags legend in-canvas
+            try { drawFlagLegend(); } catch (_) {}
+            // Update IP statistics for the current filtered data
+            updateIPStats(filteredData);
+            // Recompute size scaling once DOM updates complete
             setTimeout(() => {
                 try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch (_) {}
             }, 150);
+        });
     } finally {
         // Remove loading indicator
         loadingDiv.remove();
@@ -1852,6 +1861,202 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, index)).toFixed(1)) + ' ' + sizes[index];
 }
 
+
+// Build force layout nodes and links from current packets
+function buildForceLayoutData(packets, selectedIPs) {
+    if (!packets || packets.length === 0 || !selectedIPs || selectedIPs.length === 0) {
+        return { nodes: [], links: [] };
+    }
+
+    // Create nodes for each IP with initial positions
+    const initWidth = (typeof width !== 'undefined' && width > 0) ? width : 800;
+    const initHeight = (typeof height !== 'undefined' && height > 0) ? height : 600;
+    const ipSet = new Set(selectedIPs);
+
+    // Calculate per-IP connectivity from raw packets (before any binning)
+    const ipConnectivity = new Map();
+    selectedIPs.forEach(ip => ipConnectivity.set(ip, new Set()));
+
+    // Count unique IPs each IP communicates with
+    packets.forEach(packet => {
+        if (!packet.src_ip || !packet.dst_ip) return;
+        if (packet.src_ip === packet.dst_ip) return;
+        if (!ipSet.has(packet.src_ip) || !ipSet.has(packet.dst_ip)) return;
+
+        ipConnectivity.get(packet.src_ip).add(packet.dst_ip);
+        ipConnectivity.get(packet.dst_ip).add(packet.src_ip);
+    });
+
+    const nodes = selectedIPs.map((ip, idx) => ({
+        id: ip,
+        ip: ip,
+        index: idx,
+        degree: ipConnectivity.get(ip).size, // Number of unique connections
+        x: initWidth / 2,
+        y: TOP_PAD + idx * ROW_GAP,
+        vx: 0,
+        vy: 0
+    }));
+
+    console.log('[Force Layout] IP connectivity:', nodes.map(n => `${n.ip}: ${n.degree}`));
+
+    // Build links from packet connections
+    const linkMap = new Map();
+
+    packets.forEach(packet => {
+        if (!packet.src_ip || !packet.dst_ip) return;
+        if (packet.src_ip === packet.dst_ip) return; // Skip self-connections
+
+        // Only count packets between selected IPs
+        if (!ipSet.has(packet.src_ip) || !ipSet.has(packet.dst_ip)) return;
+
+        const key = packet.src_ip < packet.dst_ip
+            ? `${packet.src_ip}|${packet.dst_ip}`
+            : `${packet.dst_ip}|${packet.src_ip}`;
+
+        if (!linkMap.has(key)) {
+            linkMap.set(key, { count: 0, bytes: 0 });
+        }
+        const link = linkMap.get(key);
+        link.count++;
+        link.bytes += (packet.length || 0);
+    });
+
+    // Convert link map to array
+    // In D3 v7, links should reference nodes by their ID (IP address), not by index
+    const links = [];
+    linkMap.forEach((data, key) => {
+        const [src, dst] = key.split('|');
+        links.push({
+            source: src,  // Use IP address directly (matches node.id)
+            target: dst,  // Use IP address directly (matches node.id)
+            count: data.count,
+            bytes: data.bytes
+        });
+    });
+
+    console.log(`[Force Layout] Built ${links.length} links from ${packets.length} packets between ${selectedIPs.length} IPs`);
+
+    // Log top links by traffic volume for debugging
+    if (links.length > 0) {
+        const topLinks = links.slice().sort((a, b) => b.count - a.count).slice(0, 5);
+        console.log('[Force Layout] Top 5 links by packet count:', topLinks.map(l => ({
+            from: l.source,
+            to: l.target,
+            packets: l.count,
+            bytes: l.bytes
+        })));
+    }
+
+    return { nodes, links };
+}
+
+// Initialize and run force layout to position IPs
+function computeForceLayoutPositions(packets, selectedIPs, onComplete) {
+    if (isForceLayoutRunning) {
+        LOG('Force layout already running, stopping previous layout');
+        if (forceLayout) forceLayout.stop();
+    }
+
+    const { nodes, links } = buildForceLayoutData(packets, selectedIPs);
+    
+    if (nodes.length === 0) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    forceNodes = nodes;
+    forceLinks = links;
+    
+    console.log(`[Force Layout] Starting with ${nodes.length} nodes and ${links.length} links`);
+
+    // Log link strengths for debugging
+    if (links.length > 0) {
+        const maxCount = Math.max(...links.map(l => l.count));
+        const minCount = Math.min(...links.map(l => l.count));
+        console.log(`[Force Layout] Link counts: min=${minCount}, max=${maxCount}`);
+    }
+
+    // Create force simulation - match main.js approach
+    // Use 2D force layout, then extract Y positions for vertical ordering
+    const simWidth = (typeof width !== 'undefined' && width > 0) ? width : 800;
+    const simHeight = (typeof height !== 'undefined' && height > 0) ? height : 600;
+
+    forceLayout = d3.forceSimulation(forceNodes)
+        .force('charge', d3.forceManyBody().strength(-120)) // Repulsion between nodes
+        .force('link', d3.forceLink(forceLinks)
+            .id(d => d.id)
+            .distance(80) // Fixed distance like main.js force2
+            .strength(0.5))
+        .force('center', d3.forceCenter(simWidth / 2, simHeight / 2)) // Center the whole graph
+        .alphaDecay(0.02) // Slower cooling
+        .velocityDecay(0.1) // Low friction
+        .alpha(0.3) // Initial energy
+        .on('tick', () => {
+            // Update during simulation (optional - we mainly care about final positions)
+        })
+        .on('end', () => {
+            console.log('[Force Layout] Simulation ended');
+            isForceLayoutRunning = false;
+            applyForceLayoutPositions();
+            if (onComplete) onComplete();
+        });
+
+    isForceLayoutRunning = true;
+}
+
+// Apply computed force layout positions to IP positions
+function applyForceLayoutPositions() {
+    if (!forceNodes || forceNodes.length === 0) return;
+
+    console.log('[Force Layout] Applying computed positions');
+
+    // Calculate connectivity (degree) for each node
+    const connectivity = new Map();
+    forceNodes.forEach(n => connectivity.set(n.ip, 0));
+
+    if (forceLayout && forceLayout.force('link')) {
+        const linkForce = forceLayout.force('link');
+        const links = linkForce.links();
+        links.forEach(link => {
+            const src = typeof link.source === 'object' ? link.source.id : link.source;
+            const tgt = typeof link.target === 'object' ? link.target.id : link.target;
+            connectivity.set(src, (connectivity.get(src) || 0) + 1);
+            connectivity.set(tgt, (connectivity.get(tgt) || 0) + 1);
+        });
+    }
+
+    // Sort nodes by their computed Y position
+    const sortedNodes = forceNodes.slice().sort((a, b) => a.y - b.y);
+
+    console.log('[Force Layout] Final IP order:', sortedNodes.map((n, i) => `${i + 1}. ${n.ip} (${connectivity.get(n.ip)} links, y=${Math.round(n.y)})`));
+
+    // Update ipOrder and ipPositions based on sorted Y positions
+    ipOrder = sortedNodes.map(n => n.ip);
+
+    // Assign evenly-spaced Y positions based on sorted order
+    ipOrder.forEach((ip, idx) => {
+        ipPositions.set(ip, TOP_PAD + idx * ROW_GAP);
+    });
+
+    console.log('[Force Layout] Assigned screen positions:',
+        ipOrder.map((ip, idx) => ({ ip, y: TOP_PAD + idx * ROW_GAP })));
+
+    // Update the visualization to use new positions
+    if (svg && mainGroup) {
+        try {
+            // Update node labels to new positions with smooth animation
+            svg.selectAll('.node')
+                .transition()
+                .duration(800)
+                .attr('transform', d => `translate(0,${ipPositions.get(d)})`);
+
+            // Update dots/arcs will happen automatically on next render
+        } catch (e) {
+            console.error('[Force Layout] Error updating positions:', e);
+        }
+    }
+}
 function getColoredFlags(flagStats, type) {
     const flagsWithCounts = Object.entries(flagStats)
         .filter(([flag, count]) => count > 0)
@@ -3061,18 +3266,25 @@ function visualizeTimeArcs(packets) {
     });
 
     const ipList = Array.from(new Set(Array.from(ipCounts.keys())));
-    ipList.sort((a, b) => {
-        const ca = ipCounts.get(a) || 0;
-        const cb = ipCounts.get(b) || 0;
-        if (cb !== ca) return cb - ca;
-        return a.localeCompare(b);
-    });
-    // Initialize positions and order
-    ipOrder = ipList.slice();
-    ipList.forEach((ip, idx) => { ipPositions.set(ip, TOP_PAD + idx * ROW_GAP); });
 
-    const yDomain = ipList;
-    const yRange = ipList.map(ip => ipPositions.get(ip));
+    // Check if force layout has already computed positions
+    if (ipOrder.length === 0 || ipPositions.size === 0 || ipOrder.length !== ipList.length) {
+        // Force layout hasn't run yet or IP set has changed - use simple sort
+        ipList.sort((a, b) => {
+            const ca = ipCounts.get(a) || 0;
+            const cb = ipCounts.get(b) || 0;
+            if (cb !== ca) return cb - ca;
+            return a.localeCompare(b);
+        });
+        // Initialize positions and order
+        ipOrder = ipList.slice();
+        ipList.forEach((ip, idx) => { ipPositions.set(ip, TOP_PAD + idx * ROW_GAP); });
+    }
+    // Otherwise use the force layout computed positions in ipOrder and ipPositions
+
+    // Use ipOrder for yDomain to respect the force layout ordering
+    const yDomain = ipOrder.length > 0 ? ipOrder : ipList;
+    const yRange = yDomain.map(ip => ipPositions.get(ip));
     const [minY, maxY] = d3.extent(yRange.length ? yRange : [0]);
 
     height = Math.max(500, (maxY ?? 0) + ROW_GAP + DOT_RADIUS + TOP_PAD);
@@ -3693,3 +3905,4 @@ function handleFolderDataLoaded(event) {
 
 // Export functions for dynamic loading
 export { init, cleanup };
+

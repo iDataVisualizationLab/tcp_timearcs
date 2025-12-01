@@ -2478,45 +2478,54 @@
           return xStart + distortedT * totalWidth;
         },
 
-        // Fisheye distortion function that keeps the focus point fixed
-        // Simple formula: multiply distance by distortion factor near focus
+        // Fisheye distortion function that preserves monotonicity
+        // Maps normalized time [0,1] to distorted normalized position [0,1]
+        // Ensures order is preserved: if t1 < t2, then distorted(t1) < distorted(t2)
         fisheyeDistortion: function(t, focus, distortion) {
           if (distortion <= 1) return t;
 
-          // Distance from focus point
-          const delta = t - focus;
-          const distance = Math.abs(delta);
-          const sign = delta < 0 ? -1 : 1;
+          // Clamp input to valid range
+          t = Math.max(0, Math.min(1, t));
+          focus = Math.max(0, Math.min(1, focus));
 
-          if (distance < 0.0001) {
-            // At the focus point, no distortion
-            return t;
-          }
+          // Effect radius around focus (fraction of total range)
+          const effectRadius = 0.15; // 15% on each side of focus = 30% total magnified region
 
-          // Fisheye effect: points near focus expand, far points compress
-          // Use a smooth falloff based on distance
-          const effectRadius = 0.5; // Half the range is affected
+          // Define regions: [0, focusLeft], [focusLeft, focusRight], [focusRight, 1]
+          const focusLeft = Math.max(0, focus - effectRadius);
+          const focusRight = Math.min(1, focus + effectRadius);
 
-          // Calculate how much to magnify based on distance from focus
-          // Close to focus: multiply by distortion (expand)
-          // Far from focus: divide by distortion (compress)
-          let scale;
-          if (distance < effectRadius) {
-            // Inside radius: interpolate from distortion (at focus) to 1 (at radius edge)
-            const normalized = distance / effectRadius;
-            // Use cosine for smooth interpolation
-            const blend = (1 - Math.cos(normalized * Math.PI)) / 2;
-            scale = distortion - (distortion - 1) * blend;
+          // Calculate how much space each region should occupy after distortion
+          // The magnified region expands, other regions compress to compensate
+          const magnifiedWidth = focusRight - focusLeft;
+          const leftWidth = focusLeft;
+          const rightWidth = 1 - focusRight;
+
+          // Total "virtual" width if we expand magnified region by distortion factor
+          const virtualWidth = leftWidth + magnifiedWidth * distortion + rightWidth;
+
+          // Normalize back to [0,1] range - each region gets proportional space
+          const leftTargetWidth = leftWidth / virtualWidth;
+          const magnifiedTargetWidth = (magnifiedWidth * distortion) / virtualWidth;
+          const rightTargetWidth = rightWidth / virtualWidth;
+
+          // Map t to output position based on which region it's in
+          if (t <= focusLeft) {
+            // Left region: compress linearly
+            if (leftWidth === 0) return 0;
+            const localT = t / leftWidth; // Normalize to [0,1] within region
+            return localT * leftTargetWidth;
+          } else if (t <= focusRight) {
+            // Magnified region: expand linearly
+            if (magnifiedWidth === 0) return leftTargetWidth;
+            const localT = (t - focusLeft) / magnifiedWidth; // Normalize to [0,1] within region
+            return leftTargetWidth + localT * magnifiedTargetWidth;
           } else {
-            // Outside radius: compress more as we go further
-            const excessDistance = distance - effectRadius;
-            const compressionFactor = 1 / distortion;
-            scale = 1 - (1 - compressionFactor) * Math.min(1, excessDistance / (1 - effectRadius));
+            // Right region: compress linearly
+            if (rightWidth === 0) return leftTargetWidth + magnifiedTargetWidth;
+            const localT = (t - focusRight) / rightWidth; // Normalize to [0,1] within region
+            return leftTargetWidth + magnifiedTargetWidth + localT * rightTargetWidth;
           }
-
-          // Apply the scale to the distance
-          const distorted = focus + sign * distance * scale;
-          return Math.max(0, Math.min(1, distorted));
         }
       };
 

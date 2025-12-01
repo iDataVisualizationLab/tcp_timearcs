@@ -1,0 +1,120 @@
+
+// Build force layout nodes and links from current packets
+function buildForceLayoutData(packets, selectedIPs) {
+    if (!packets || packets.length === 0 || !selectedIPs || selectedIPs.length === 0) {
+        return { nodes: [], links: [] };
+    }
+
+    // Create nodes for each IP
+    const nodes = selectedIPs.map((ip, idx) => ({
+        id: ip,
+        ip: ip,
+        index: idx,
+        x: width / 2,
+        y: TOP_PAD + idx * ROW_GAP,
+        vx: 0,
+        vy: 0,
+        fixed: false
+    }));
+
+    // Build links from packet connections
+    const linkMap = new Map();
+    packets.forEach(packet => {
+        if (!packet.src_ip || !packet.dst_ip) return;
+        if (packet.src_ip === packet.dst_ip) return; // Skip self-connections
+        
+        const key = packet.src_ip < packet.dst_ip 
+            ? `${packet.src_ip}|${packet.dst_ip}`
+            : `${packet.dst_ip}|${packet.src_ip}`;
+        
+        if (!linkMap.has(key)) {
+            linkMap.set(key, { count: 0, bytes: 0 });
+        }
+        const link = linkMap.get(key);
+        link.count++;
+        link.bytes += (packet.length || 0);
+    });
+
+    // Convert link map to array
+    const ipIndexMap = new Map(nodes.map((n, i) => [n.ip, i]));
+    const links = [];
+    linkMap.forEach((data, key) => {
+        const [src, dst] = key.split('|');
+        const srcIdx = ipIndexMap.get(src);
+        const dstIdx = ipIndexMap.get(dst);
+        if (srcIdx !== undefined && dstIdx !== undefined) {
+            links.push({
+                source: srcIdx,
+                target: dstIdx,
+                count: data.count,
+                bytes: data.bytes
+            });
+        }
+    });
+
+    return { nodes, links };
+}
+
+// Initialize and run force layout to position IPs
+function computeForceLayoutPositions(packets, selectedIPs, onComplete) {
+    if (isForceLayoutRunning) {
+        LOG('Force layout already running, stopping previous layout');
+        if (forceLayout) forceLayout.stop();
+    }
+
+    const { nodes, links } = buildForceLayoutData(packets, selectedIPs);
+    
+    if (nodes.length === 0) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    forceNodes = nodes;
+    forceLinks = links;
+    
+    LOG(`Starting force layout with ${nodes.length} nodes and ${links.length} links`);
+
+    // Create force simulation
+    forceLayout = d3.layout.force()
+        .size([width / 4, height]) // Constrain to narrow vertical strip
+        .nodes(forceNodes)
+        .links(forceLinks)
+        .charge(-180) // Repulsion between nodes
+        .linkDistance(ROW_GAP * 1.5) // Desired distance between connected nodes
+        .linkStrength(d => Math.min(1.0, d.count / 100)) // Stronger links for more packets
+        .gravity(0.02) // Weak centering force
+        .friction(0.9)
+        .alpha(0.1)
+        .on('tick', () => {
+            // Update during simulation (optional - we mainly care about final positions)
+        })
+        .on('end', () => {
+            LOG('Force layout converged');
+            isForceLayoutRunning = false;
+            applyForceLayoutPositions();
+            if (onComplete) onComplete();
+        });
+
+    isForceLayoutRunning = true;
+    forceLayout.start();
+}
+
+// Apply computed force layout positions to IP positions
+function applyForceLayoutPositions() {
+    if (!forceNodes || forceNodes.length === 0) return;
+
+    LOG('Applying force layout positions to IPs');
+
+    // Sort nodes by their computed Y position
+    const sortedNodes = forceNodes.slice().sort((a, b) => a.y - b.y);
+    
+    // Update ipOrder and ipPositions based on sorted Y positions
+    ipOrder = sortedNodes.map(n => n.ip);
+    
+    // Assign evenly-spaced Y positions based on sorted order
+    ipOrder.forEach((ip, idx) => {
+        ipPositions.set(ip, TOP_PAD + idx * ROW_GAP);
+    });
+
+    LOG('Updated IP positions:', Array.from(ipPositions.entries()));
+}
