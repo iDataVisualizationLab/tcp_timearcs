@@ -5,6 +5,12 @@ import { buildRelationships, computeConnectivityFromRelationships, computeLinks,
 import { linkArc, gradientIdForLink } from './src/rendering/arcPath.js';
 import { buildLegend as createLegend, updateLegendVisualState as updateLegendUI, isolateAttack as isolateLegendAttack } from './src/ui/legend.js';
 import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
+import { detectTimestampUnit, createToDateConverter, createTimeScale, createIpScale, createWidthScale, calculateMaxArcRadius } from './src/scales/scaleFactory.js';
+import { createForceSimulation, runUntilConverged, createComponentSeparationForce, createWeakComponentSeparationForce, createComponentCohesionForce, createHubCenteringForce, createComponentYForce, initializeNodePositions, calculateComponentCenters, findComponentHubIps, calculateIpDegrees } from './src/layout/forceSimulation.js';
+import { applyLens1D, createLensXScale, createFisheyeScale, createHorizontalFisheyeScale, fisheyeDistort } from './src/scales/distortion.js';
+import { computeIpSpans, createSpanData, renderRowLines, renderIpLabels, createLabelHoverHandler, createLabelMoveHandler, createLabelLeaveHandler, attachLabelHoverHandlers } from './src/rendering/rows.js';
+import { createArcHoverHandler, createArcMoveHandler, createArcLeaveHandler, attachArcHandlers } from './src/rendering/arcInteractions.js';
+import { loadAllMappings } from './src/mappings/loaders.js';
 
 // Network TimeArcs visualization
 // Input CSV schema: timestamp,length,src_ip,dst_ip,protocol,count
@@ -161,14 +167,22 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
   // Initialize mappings, then try a default CSV load
   (async function init() {
     try {
-      await Promise.all([
-        loadIpMap(),
-        loadEventTypeMap(),
-        loadColorMapping(),
-        loadAttackGroupMap(),
-        loadAttackGroupColorMapping(),
-      ]);
-    } catch (_) { /* non-fatal */ }
+      const mappings = await loadAllMappings(canonicalizeName);
+      ipIdToAddr = mappings.ipIdToAddr;
+      ipMapLoaded = ipIdToAddr !== null && ipIdToAddr.size > 0;
+      attackIdToName = mappings.attackIdToName;
+      colorByAttack = mappings.colorByAttack;
+      rawColorByAttack = mappings.rawColorByAttack;
+      attackGroupIdToName = mappings.attackGroupIdToName;
+      colorByAttackGroup = mappings.colorByAttackGroup;
+      rawColorByAttackGroup = mappings.rawColorByAttackGroup;
+
+      if (ipMapLoaded) {
+        setStatus(statusEl, `IP map loaded (${ipIdToAddr.size} entries). Upload CSV to render.`);
+      }
+    } catch (err) {
+      console.warn('Mapping load failed:', err);
+    }
     // After maps are ready (or failed gracefully), try default CSV
     tryLoadDefaultCsv();
   })();
@@ -547,64 +561,19 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     const tsMin = d3.min(data, d => d.timestamp);
     const tsMax = d3.max(data, d => d.timestamp);
     // Heuristic timestamp unit detection by magnitude:
-    // - Microseconds: > 1e15
-    // - Milliseconds: > 1e12 and <= 1e15
-    // - Seconds: > 1e9 and <= 1e12
-    // - Minutes: > 1e7 and <= 1e9
-    // - Hours: > 1e5 and <= 1e7
-    // Otherwise: treat as relative values (default unit minutes to preserve legacy)
-    const looksLikeMicroseconds = tsMin > 1e15;
-    const looksLikeMilliseconds = tsMin > 1e12 && tsMin <= 1e15;
-    const looksLikeSeconds = tsMin > 1e9 && tsMin <= 1e12;
-    const looksLikeMinutesAbs = tsMin > 1e7 && tsMin <= 1e9;
-    const looksLikeHoursAbs = tsMin > 1e5 && tsMin <= 1e7;
-    const looksAbsolute = looksLikeMicroseconds || looksLikeMilliseconds || looksLikeSeconds || looksLikeMinutesAbs || looksLikeHoursAbs;
-    
-    let unit = 'minutes'; // one of: microseconds|milliseconds|seconds|minutes|hours
-    if (looksLikeMicroseconds) unit = 'microseconds';
-    else if (looksLikeMilliseconds) unit = 'milliseconds';
-    else if (looksLikeSeconds) unit = 'seconds';
-    else if (looksLikeMinutesAbs) unit = 'minutes';
-    else if (looksLikeHoursAbs) unit = 'hours';
-    
-    const base = looksAbsolute ? 0 : tsMin; // normalize relative timelines to start at 0
-    const unitMs = unit === 'microseconds' ? 0.001
-                  : unit === 'milliseconds' ? 1
-                  : unit === 'seconds' ? 1000
-                  : unit === 'minutes' ? 60_000
-                  : 3_600_000; // hours
-    const unitSuffix = unit === 'seconds' ? 's' : unit === 'hours' ? 'h' : 'm';
+    // Detect timestamp unit and create converter using factory
+    const timeInfo = detectTimestampUnit(tsMin, tsMax);
+    const { unit, looksAbsolute, unitMs, unitSuffix, base } = timeInfo;
+    const toDate = createToDateConverter(timeInfo);
     
     console.log('Timestamp debug:', {
       tsMin,
       tsMax,
-      looksLikeMicroseconds,
-      looksLikeMilliseconds,
       looksAbsolute,
       inferredUnit: unit,
       base,
       sampleTimestamps: data.slice(0, 5).map(d => d.timestamp)
     });
-
-    const toDate = (m) => {
-      if (m === undefined || m === null || !isFinite(m)) {
-        console.warn('Invalid timestamp in toDate:', m);
-        return new Date(0); // Return epoch as fallback
-      }
-      
-      // Convert using detected unit; for absolute series use m as-is, otherwise offset by base
-      const val = looksAbsolute ? m : (m - base);
-      const ms = unit === 'microseconds' ? (val / 1000)
-               : unit === 'milliseconds' ? (val)
-               : (val * unitMs);
-      const result = new Date(ms);
-      
-      if (!isFinite(result.getTime())) {
-        console.warn('Invalid date result in toDate:', { m, looksAbsolute, unit, base, computedMs: ms });
-        return new Date(0); // Return epoch as fallback
-      }
-      return result;
-    };
 
     // Aggregate links; then order IPs using the React component's approach:
     // primary-attack grouping, groups ordered by earliest time, nodes within group by force-simulated y
@@ -620,9 +589,12 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     const nodeData = computeNodesByAttackGrouping(links);
     const nodes = nodeData.nodes;
     const ips = nodes.map(n => n.name);
-    const simulation = nodeData.simulation;
-    const simNodes = nodeData.simNodes;
-    const yMap = nodeData.yMap;
+    const { simNodes, simLinks, yMap, components, ipToComponent } = nodeData;
+    
+    // Create simulation using the factory function
+    const simulation = createForceSimulation(d3, simNodes, simLinks);
+    simulation._components = components;
+    simulation._ipToComponent = ipToComponent;
     
     // Ensure all IPs from links are included in the initial IP list
     // This prevents misalignment when arcs reference IPs not in the nodes list
@@ -703,9 +675,7 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     const xStart = MARGIN.left;
     const xEnd = svgWidth - MARGIN.right - maxArcRadius;
 
-    const x = d3.scaleTime()
-      .domain([xMinDate, xMaxDate])
-      .range([xStart, xEnd]);
+    const x = createTimeScale(d3, xMinDate, xMaxDate, xStart, xEnd);
 
     // Calculate base gap for lens calculations
     XGAP_BASE = timelineWidth / (tsMax - tsMin);
@@ -715,84 +685,27 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       lensCenter = (tsMin + tsMax) / 2;
     }
 
-    // Generic 1D lens transform that:
-    //  - expands a band around lensCenterNorm by lensingMul
-    //  - compresses everything outside that band
-    //  - keeps the overall [0,1] interval fixed (0 -> 0, 1 -> 1)
-    function applyLens1D(normalized, lensCenterNorm, bandRadiusNorm, magnification) {
-      const n = Math.min(1, Math.max(0, normalized));
-      const c = Math.min(1, Math.max(0, lensCenterNorm));
-      const r = Math.max(0, bandRadiusNorm);
+    // Track the current xEnd value (will be updated after arc radius calculation)
+    let currentXEnd = xEnd;
 
-      if (magnification <= 1 || r === 0) return n;
-
-      const a = Math.max(0, c - r);
-      const b = Math.min(1, c + r);
-      const insideLength = Math.max(0, b - a);
-      const outsideLength = a + (1 - b);
-
-      if (insideLength === 0 || outsideLength < 0) return n;
-
-      const scale = 1 / (outsideLength + insideLength * magnification);
-
-      if (n < a) {
-        // Before lens band: compressed towards 0
-        return n * scale;
-      } else if (n > b) {
-        // After lens band: compressed towards 1
-        const base = scale * (a + insideLength * magnification);
-        return base + (n - b) * scale;
-      } else {
-        // Inside lens band: expanded around center
-        const base = scale * a;
-        return base + (n - a) * magnification * scale;
-      }
-    }
-
-    // Lens-aware x scale function
-    function xScaleLens(timestamp) {
-      const minX = xStart;
-      const maxX = xEnd;
-
-      // Use horizontal fisheye if enabled
-      if (fisheyeEnabled && horizontalFisheyeScale) {
-        const fisheyeX = horizontalFisheyeScale.apply(timestamp);
-        return Math.max(minX, Math.min(fisheyeX, maxX));
-      }
-
-      if (!isLensing) {
-        // Even when lensing is off, clamp to ensure arcs don't go out of bounds
-        const rawX = x(toDate(timestamp));
-        return Math.max(minX, Math.min(rawX, maxX));
-      }
-
-      // Safety check for zero range
-      if (tsMax === tsMin) {
-        const rawX = x(toDate(timestamp));
-        return Math.max(minX, Math.min(rawX, maxX));
-      }
-
-      // Convert timestamp to normalized position (0 to 1)
-      const normalized = (timestamp - tsMin) / (tsMax - tsMin);
-      const totalWidth = xEnd - xStart;
-
-      // Lens parameters (matching main.js: numLens = 5 months on each side)
-      // For continuous time, approximate 5 months out of ~108 months = ~4.6% on each side
-      const lensCenterNorm = (lensCenter - tsMin) / (tsMax - tsMin);
-      const bandRadiusNorm = 0.045; // ~4.5% on each side (matching main.js's 5 months out of ~108)
-
-      const position = applyLens1D(normalized, lensCenterNorm, bandRadiusNorm, lensingMul);
-      // Map into screen coordinates and clamp to visible timeline so arcs
-      // never extend beyond the right edge of the chart.
-      const rawX = minX + position * totalWidth;
-      return Math.max(minX, Math.min(rawX, maxX));
-    }
+    // Lens-aware x scale function using imported factory
+    const xScaleLens = createLensXScale({
+      xScale: x,
+      tsMin,
+      tsMax,
+      xStart,
+      xEnd: xEnd, // Use initial xEnd, will be updated via getter
+      toDate,
+      getIsLensing: () => isLensing,
+      getLensCenter: () => lensCenter,
+      getLensingMul: () => lensingMul,
+      getHorizontalFisheyeScale: () => horizontalFisheyeScale,
+      getFisheyeEnabled: () => fisheyeEnabled,
+      getXEnd: () => currentXEnd // Dynamic getter for updated xEnd
+    });
 
     // Use allIps for the y scale to ensure all IPs referenced in arcs are included
-    const y = d3.scalePoint()
-      .domain(allIps)
-      .range([MARGIN.top, MARGIN.top + INNER_HEIGHT])
-      .padding(0.5);
+    const y = createIpScale(d3, allIps, MARGIN.top, MARGIN.top + INNER_HEIGHT, 0.5);
     
     console.log('Y-scale debug:', {
       domain: allIps,
@@ -814,12 +727,9 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     }
 
     // Width scale by aggregated link count (log scale like the React version)
-    let minLinkCount = d3.min(links, d => Math.max(1, d.count)) || 1;
-    let maxLinkCount = d3.max(links, d => Math.max(1, d.count)) || 1;
-    // Guard: log scale requires domain > 0 and non-degenerate
-    minLinkCount = Math.max(1, minLinkCount);
-    if (maxLinkCount <= minLinkCount) maxLinkCount = minLinkCount + 1;
-    const widthScale = d3.scaleLog().domain([minLinkCount, maxLinkCount]).range([1, 4]);
+    const minLinkCount = d3.min(links, d => Math.max(1, d.count)) || 1;
+    const maxLinkCount = d3.max(links, d => Math.max(1, d.count)) || 1;
+    const widthScale = createWidthScale(d3, minLinkCount, maxLinkCount);
     // Keep lengthScale (unused) for completeness
     const maxLen = d3.max(data, d => d.length || 0) || 0;
     const lengthScale = d3.scaleLinear().domain([0, Math.max(1, maxLen)]).range([0.6, 2.2]);
@@ -862,27 +772,11 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     // Row labels and span lines: draw per-IP line only from first to last activity
     const rows = svg.append('g');
     // compute first/last minute per IP based on aggregated links
-    const ipSpans = new Map(); // ip -> {min, max}
-    for (const l of links) {
-      for (const ip of [l.source, l.target]) {
-        const span = ipSpans.get(ip) || { min: l.minute, max: l.minute };
-        if (l.minute < span.min) span.min = l.minute;
-        if (l.minute > span.max) span.max = l.minute;
-        ipSpans.set(ip, span);
-      }
-    }
+    const ipSpans = computeIpSpans(links);
     // Use allIps to ensure all IPs have row lines, matching the labels and arcs
-    const spanData = allIps.map(ip => ({ ip, span: ipSpans.get(ip) }));
+    const spanData = createSpanData(allIps, ipSpans);
 
-    rows.selectAll('line')
-      .data(spanData)
-      .join('line')
-      .attr('class', 'row-line')
-      .attr('x1', MARGIN.left)
-      .attr('x2', MARGIN.left)
-      .attr('y1', d => yScaleLens(d.ip))
-      .attr('y2', d => yScaleLens(d.ip))
-      .style('opacity', 0); // Hidden during force simulation
+    renderRowLines(rows, spanData, MARGIN.left, yScaleLens);
 
     // Build legend (attack types)
     buildLegend(attacks, colorForAttack);
@@ -940,26 +834,7 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     // Create labels for all IPs to ensure alignment with arcs
     // Match main.js: labels positioned at first arc time (xConnected) initially
     // Must be created after nodes are set up and positions are calculated
-    const ipLabels = rows.selectAll('text')
-      .data(allIps)
-      .join('text')
-      .attr('class', 'ip-label')
-      .attr('data-ip', d => d)
-      .attr('x', d => {
-        // Match main.js: position at xConnected (text-anchor="end" means text ends at this position)
-        // In main.js, text has no x offset, it's positioned by group transform at xConnected
-        const node = ipToNode.get(d);
-        return node && node.xConnected !== undefined ? node.xConnected : MARGIN.left;
-      })
-      .attr('y', d => {
-        // Match main.js: use node's Y position (n.y)
-        const node = ipToNode.get(d);
-        return node && node.y !== undefined ? node.y : yScaleLens(d);
-      })
-      .attr('text-anchor', 'end')
-      .attr('dominant-baseline', 'middle')
-      .style('cursor', 'pointer')
-      .text(d => d);
+    const ipLabels = renderIpLabels(rows, allIps, ipToNode, MARGIN.left, yScaleLens);
 
     // Create per-link gradients from grey (source) to attack color (destination)
     const defs = svg.append('defs');
@@ -1021,108 +896,42 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
         d.target.y = y2;
 
         return linkArc(d);
-      })
-      .on('mouseover', function (event, d) {
-        // Calculate current arc endpoint positions (matching main.js pattern)
-        // These positions match exactly how the arc is rendered in attr('d')
-        const xp = xScaleLens(d.minute);
-        const y1 = yScaleLens(d.sourceNode.name);
-        const y2 = yScaleLens(d.targetNode.name);
-
-        // Validate positions
-        if (!isFinite(xp) || !isFinite(y1) || !isFinite(y2)) {
-          console.warn('Invalid positions for hover:', { xp, y1, y2, minute: d.minute, source: d.sourceNode.name, target: d.targetNode.name });
-          return;
-        }
-
-        // Highlight hovered arc at 100% opacity, others at 30% (override CSS with inline style)
-        arcPaths.style('stroke-opacity', p => (p === d ? 1 : 0.3));
-        const baseW = widthScale(Math.max(1, d.count));
-        d3.select(this).attr('stroke-width', Math.max(3, baseW < 2 ? baseW * 3 : baseW * 1.5)).raise();
-
-        const active = new Set([d.sourceNode.name, d.targetNode.name]);
-        svg.selectAll('.row-line')
-          .attr('stroke-opacity', s => s && s.ip && active.has(s.ip) ? 0.8 : 0.1)
-          .attr('stroke-width', s => s && s.ip && active.has(s.ip) ? 1 : 0.4);
-        const attackCol = colorForAttack((labelMode==='attack_group'? d.attack_group : d.attack) || 'normal');
-        const labelSelection = svg.selectAll('.ip-label');
-        labelSelection
-          .attr('font-weight', s => active.has(s) ? 'bold' : null)
-          .style('font-size', s => active.has(s) ? '14px' : null)
-          .style('fill', s => active.has(s) ? attackCol : '#343a40')
-          // Ensure endpoint labels are visible even if baseline labels are hidden
-          .style('opacity', s => {
-            if (active.has(s)) return 1;
-            // Preserve compressed/normal mode for non-active labels (matching main.js: no vertical lensing)
-            if (!labelsCompressedMode) return 1;
-            return 0; // Hide labels in compressed mode
-          });
-
-        // Move the two endpoint labels close to the hovered link's time and align to arc ends
-        // Match main.js line 1042-1043: xStep+xScale(year) for X, n.y for Y
-        // In main.js: labels move to link's time X position but keep node's Y position
-        svg.selectAll('.ip-label')
-          .filter(s => active.has(s))
-          .transition()
-          .duration(200)
-          .attr('x', xp) // xp = xScaleLens(d.minute), equivalent to xStep+xScale(year) in main.js
-          .attr('y', s => {
-            // Match main.js line 1043: use node's Y position (n.y)
-            // Get node object and use its y property (maintained by updateNodePositions)
-            const node = ipToNode.get(s);
-            if (node && node.y !== undefined) {
-              return node.y; // Match main.js: n.y
-            }
-            // Fallback to scale if node not found
-            return yScaleLens(s);
-          });
-
-        const dt = toDate(d.minute);
-        const timeStr = looksAbsolute ? utcTick(dt) : `t=${d.minute - base} ${unitSuffix}`;
-        const content = `${d.sourceNode.name} → ${d.targetNode.name}<br>` +
-          (labelMode==='attack_group' ? `Attack Group: ${d.attack_group || 'normal'}<br>` : `Attack: ${d.attack || 'normal'}<br>`) +
-          `${timeStr}<br>` +
-          `count=${d.count}`;
-        showTooltip(tooltip, event, content);
-      })
-      .on('mousemove', function (event) {
-        // keep tooltip following cursor
-        if (tooltip && tooltip.style.display !== 'none') {
-          const pad = 10;
-          tooltip.style.left = (event.clientX + pad) + 'px';
-          tooltip.style.top = (event.clientY + pad) + 'px';
-        }
-      })
-      .on('mouseout', function () {
-        hideTooltip(tooltip);
-        // Restore default opacity (use style to override CSS)
-        arcPaths.style('stroke-opacity', 0.6)
-                .attr('stroke-width', d => widthScale(Math.max(1, d.count)));
-        svg.selectAll('.row-line').attr('stroke-opacity', 1).attr('stroke-width', 0.4);
-        const labelSelection = svg.selectAll('.ip-label');
-        labelSelection
-          .attr('font-weight', null)
-          .style('font-size', null)
-          .style('fill', '#343a40')
-          .transition()
-          .duration(200)
-          .attr('x', s => {
-            // Match main.js line 1072-1073: restore to xConnected (strongest connection position)
-            const node = ipToNode.get(s);
-            return node && node.xConnected !== undefined ? node.xConnected : MARGIN.left;
-          })
-          .attr('y', s => {
-            // Match main.js: use node's Y position (n.y)
-            const node = ipToNode.get(s);
-            return node && node.y !== undefined ? node.y : yScaleLens(s);
-          });
-
-        // Restore opacity according to compressed mode (matching main.js: no vertical lensing)
-        labelSelection.style('opacity', s => {
-          if (!labelsCompressedMode) return 1;
-          return 0; // Hide labels in compressed mode
-        });
       });
+
+    // Create arc interaction handlers using factory functions
+    const arcHoverHandler = createArcHoverHandler({
+      arcPaths,
+      svg,
+      ipToNode,
+      widthScale,
+      xScaleLens: (m) => xScaleLens(m),
+      yScaleLens: (ip) => yScaleLens(ip),
+      colorForAttack,
+      showTooltip: (evt, html) => showTooltip(tooltip, evt, html),
+      getLabelMode: () => labelMode,
+      toDate,
+      timeFormatter: utcTick,
+      looksAbsolute,
+      unitSuffix,
+      base,
+      getLabelsCompressedMode: () => labelsCompressedMode,
+      marginLeft: MARGIN.left
+    });
+
+    const arcMoveHandler = createArcMoveHandler({ tooltip });
+
+    const arcLeaveHandler = createArcLeaveHandler({
+      arcPaths,
+      svg,
+      ipToNode,
+      widthScale,
+      hideTooltip: () => hideTooltip(tooltip),
+      yScaleLens: (ip) => yScaleLens(ip),
+      getLabelsCompressedMode: () => labelsCompressedMode,
+      marginLeft: MARGIN.left
+    });
+
+    attachArcHandlers(arcPaths, arcHoverHandler, arcMoveHandler, arcLeaveHandler);
     
     // Store arcPaths reference for legend filtering (after all handlers are attached)
     currentArcPaths = arcPaths;
@@ -1131,149 +940,45 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
     updateArcVisibility();
 
     // Add hover handlers to IP labels to highlight connected arcs
-    ipLabels
-      .on('mouseover', function (event, hoveredIp) {
-        // Find all arcs connected to this IP (as source or target)
-        const connectedArcs = linksWithNodes.filter(l => l.sourceNode.name === hoveredIp || l.targetNode.name === hoveredIp);
-        const connectedIps = new Set();
-        connectedArcs.forEach(l => {
-          connectedIps.add(l.sourceNode.name);
-          connectedIps.add(l.targetNode.name);
-        });
-
-        // Highlight connected arcs: full opacity for connected, dim others
-        arcPaths.style('stroke-opacity', d => {
-          const isConnected = d.sourceNode.name === hoveredIp || d.targetNode.name === hoveredIp;
-          return isConnected ? 1 : 0.2;
-        })
-        .attr('stroke-width', d => {
-          const isConnected = d.sourceNode.name === hoveredIp || d.targetNode.name === hoveredIp;
-          if (isConnected) {
-            const baseW = widthScale(Math.max(1, d.count));
-            return Math.max(3, baseW < 2 ? baseW * 2.5 : baseW * 1.3);
-          }
-          return widthScale(Math.max(1, d.count));
-        });
-
-        // Highlight row lines for connected IPs
-        svg.selectAll('.row-line')
-          .attr('stroke-opacity', s => s && s.ip && connectedIps.has(s.ip) ? 0.8 : 0.1)
-          .attr('stroke-width', s => s && s.ip && connectedIps.has(s.ip) ? 1 : 0.4);
-
-        // Highlight IP labels for connected IPs
-        const hoveredLabel = d3.select(this);
-        const hoveredColor = hoveredLabel.style('fill') || '#343a40';
-        svg.selectAll('.ip-label')
-          .attr('font-weight', s => connectedIps.has(s) ? 'bold' : null)
-          .style('font-size', s => connectedIps.has(s) ? '14px' : null)
-          .style('fill', s => {
-            if (s === hoveredIp) return hoveredColor;
-            return connectedIps.has(s) ? '#007bff' : '#343a40';
-          });
-
-        // Show tooltip with IP information
-        const arcCount = connectedArcs.length;
-        const uniqueConnections = new Set();
-        connectedArcs.forEach(l => {
-          if (l.sourceNode.name === hoveredIp) uniqueConnections.add(l.targetNode.name);
-          if (l.targetNode.name === hoveredIp) uniqueConnections.add(l.sourceNode.name);
-        });
-        const content = `IP: ${hoveredIp}<br>` +
-          `Connected arcs: ${arcCount}<br>` +
-          `Unique connections: ${uniqueConnections.size}`;
-        showTooltip(tooltip, event, content);
-      })
-      .on('mousemove', function (event) {
-        // Keep tooltip following cursor
-        if (tooltip && tooltip.style.display !== 'none') {
-          const pad = 10;
-          tooltip.style.left = (event.clientX + pad) + 'px';
-          tooltip.style.top = (event.clientY + pad) + 'px';
-        }
-      })
-      .on('mouseout', function () {
-        hideTooltip(tooltip);
-        // Restore default state
-        arcPaths.style('stroke-opacity', 0.6)
-                .attr('stroke-width', d => widthScale(Math.max(1, d.count)));
-        svg.selectAll('.row-line').attr('stroke-opacity', 1).attr('stroke-width', 0.4);
-        svg.selectAll('.ip-label')
-          .attr('font-weight', null)
-          .style('font-size', null)
-          .style('fill', '#343a40');
-      });
+    const labelHoverHandler = createLabelHoverHandler({
+      linksWithNodes,
+      arcPaths,
+      svg,
+      widthScale,
+      showTooltip,
+      tooltip
+    });
+    const labelMoveHandler = createLabelMoveHandler(tooltip);
+    const labelLeaveHandler = createLabelLeaveHandler({
+      arcPaths,
+      svg,
+      widthScale,
+      hideTooltip,
+      tooltip
+    });
+    attachLabelHoverHandlers(ipLabels, labelHoverHandler, labelMoveHandler, labelLeaveHandler);
 
     // Phase 1: Run force simulation for natural clustering with component separation
     setStatus(statusEl,'Stabilizing network layout...');
     
     // Run simulation to completion immediately (not visually)
     const centerX = (MARGIN.left + width - MARGIN.right) / 2;
-    const components = simulation._components || [];
-    const ipToComponent = simulation._ipToComponent || new Map();
     
-    // Calculate degree (number of connections) for each IP from links
-    const ipDegree = new Map();
-    linksWithNodes.forEach(l => {
-      ipDegree.set(l.sourceNode.name, (ipDegree.get(l.sourceNode.name) || 0) + 1);
-      ipDegree.set(l.targetNode.name, (ipDegree.get(l.targetNode.name) || 0) + 1);
-    });
+    // Calculate degree (number of connections) for each IP from links using imported function
+    const ipDegree = calculateIpDegrees(linksWithNodes);
     
-    // Find the IP with highest degree in each component
-    const componentHubIps = new Map(); // compIdx -> ip with highest degree
-    components.forEach((comp, compIdx) => {
-      let maxDegree = -1;
-      let hubIp = null;
-      comp.forEach(ip => {
-        const degree = ipDegree.get(ip) || 0;
-        if (degree > maxDegree) {
-          maxDegree = degree;
-          hubIp = ip;
-        }
-      });
-      if (hubIp) {
-        componentHubIps.set(compIdx, hubIp);
-        console.log(`Component ${compIdx} hub IP: ${hubIp} (degree: ${maxDegree})`);
-      }
+    // Find hub IPs using imported function
+    const componentHubIps = findComponentHubIps(components, ipDegree);
+    componentHubIps.forEach((hubIp, compIdx) => {
+      console.log(`Component ${compIdx} hub IP: ${hubIp} (degree: ${ipDegree.get(hubIp) || 0})`);
     });
-
-    // Helper: run simulation until kinetic energy stabilizes
-    function runUntilConverged(sim, maxIterations = 300, threshold = 0.001) {
-      let prevEnergy = Infinity;
-      let stableCount = 0;
-
-      for (let i = 0; i < maxIterations; i++) {
-        sim.tick();
-
-        // Calculate total kinetic energy
-        const energy = sim.nodes().reduce((sum, n) =>
-          sum + (n.vx * n.vx + n.vy * n.vy), 0);
-
-        // Check for convergence
-        if (Math.abs(prevEnergy - energy) < threshold) {
-          stableCount++;
-          if (stableCount >= 5) {
-            console.log(`Converged after ${i + 1} iterations`);
-            return i + 1;
-          }
-        } else {
-          stableCount = 0;
-        }
-        prevEnergy = energy;
-      }
-
-      console.log(`Max iterations (${maxIterations}) reached`);
-      return maxIterations;
-    }
 
     // Initialize nodes based on component membership for better separation
     if (components.length > 1) {
       console.log(`Applying force layout separation for ${components.length} components`);
       
-      // Calculate component centers and sizes for better spacing
-      const componentSizes = components.map(comp => comp.length);
-      const totalNodes = componentSizes.reduce((a, b) => a + b, 0);
+      // Calculate component centers using imported function
       const componentSpacing = INNER_HEIGHT / components.length;
-      const minGap = 40; // Minimum gap between components
       
       // Log component sizes for debugging
       components.forEach((comp, idx) => {
@@ -1281,234 +986,19 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       });
       
       // Calculate target Y positions for each component center
-      const componentCenters = new Map();
-      components.forEach((comp, compIdx) => {
-        const componentStart = MARGIN.top + compIdx * componentSpacing;
-        const componentCenter = componentStart + componentSpacing / 2;
-        componentCenters.set(compIdx, componentCenter);
-      });
+      const componentCenters = calculateComponentCenters(components, MARGIN.top, INNER_HEIGHT);
       
-      // Initialize node positions deterministically: place nodes near their component center
-      // Sort nodes within each component by degree (descending) for consistent ordering
-      const nodesByComponent = new Map();
-      simNodes.forEach(n => {
-        const compIdx = ipToComponent.get(n.id) || 0;
-        if (!nodesByComponent.has(compIdx)) {
-          nodesByComponent.set(compIdx, []);
-        }
-        nodesByComponent.get(compIdx).push(n);
-      });
-      
-      // Sort nodes within each component by degree (descending), then by IP string for stability
-      nodesByComponent.forEach((nodeList, compIdx) => {
-        nodeList.sort((a, b) => {
-          const degreeA = ipDegree.get(a.id) || 0;
-          const degreeB = ipDegree.get(b.id) || 0;
-          if (degreeB !== degreeA) return degreeB - degreeA; // Higher degree first
-          return a.id.localeCompare(b.id); // Then by IP string for consistency
-        });
-      });
-      
-      // Initialize positions deterministically based on sorted order
-      nodesByComponent.forEach((nodeList, compIdx) => {
-        const targetY = componentCenters.get(compIdx) || (MARGIN.top + INNER_HEIGHT / 2);
-        const spread = Math.min(componentSpacing * 0.3, 30);
-        const step = nodeList.length > 1 ? spread / (nodeList.length - 1) : 0;
-        
-        nodeList.forEach((n, idx) => {
-          n.x = centerX;
-          // Distribute nodes evenly around component center, with hub (first) at center
-          if (nodeList.length === 1) {
-            n.y = targetY;
-          } else {
-            const offset = (idx - (nodeList.length - 1) / 2) * step;
-            n.y = targetY + offset;
-          }
-          // Initialize velocities
-          n.vx = 0;
-          n.vy = 0;
-        });
-      });
+      // Initialize node positions using imported function
+      initializeNodePositions(simNodes, ipToComponent, componentCenters, centerX, ipDegree, componentSpacing);
       
       // Stage 1: Strong component separation - push components apart
-      // Use a stronger Y force to position components in their vertical regions
-      simulation.force('y', d3.forceY()
-        .y(n => {
-          const compIdx = ipToComponent.get(n.id) || 0;
-          return componentCenters.get(compIdx) || (MARGIN.top + INNER_HEIGHT / 2);
-        })
-        .strength(1.0) // Very strong to enforce component separation
-      );
+      // Use the Y force from the imported function
+      simulation.force('y', createComponentYForce(d3, ipToComponent, componentCenters, MARGIN.top + INNER_HEIGHT / 2));
       
-      // Enhanced component separation force: repels nodes from different components
-      // This uses a stronger, more effective approach
-      const componentSeparationForce = (alpha) => {
-        const separationStrength = 1.2; // Increased strength
-        const minDistance = 80; // Minimum distance between components
-        
-        // Compute component centroids for more efficient separation
-        const componentCentroids = new Map();
-        const componentCounts = new Map();
-        simNodes.forEach(n => {
-          const compIdx = ipToComponent.get(n.id) || -1;
-          if (!componentCentroids.has(compIdx)) {
-            componentCentroids.set(compIdx, { x: 0, y: 0 });
-            componentCounts.set(compIdx, 0);
-          }
-          const centroid = componentCentroids.get(compIdx);
-          centroid.x += n.x || 0;
-          centroid.y += n.y || 0;
-          componentCounts.set(compIdx, componentCounts.get(compIdx) + 1);
-        });
-        
-        // Normalize centroids
-        componentCentroids.forEach((centroid, compIdx) => {
-          const count = componentCounts.get(compIdx);
-          if (count > 0) {
-            centroid.x /= count;
-            centroid.y /= count;
-          }
-        });
-        
-        // Apply separation between component centroids
-        const compIndices = Array.from(componentCentroids.keys());
-        for (let i = 0; i < compIndices.length; i++) {
-          for (let j = i + 1; j < compIndices.length; j++) {
-            const compA = compIndices[i];
-            const compB = compIndices[j];
-            const centroidA = componentCentroids.get(compA);
-            const centroidB = componentCentroids.get(compB);
-            
-            const dx = centroidB.x - centroidA.x;
-            const dy = centroidB.y - centroidA.y;
-            const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-            
-            // Push components apart if too close
-            if (distance < minDistance * 2) {
-              const force = (minDistance * 2 - distance) / distance * separationStrength * alpha;
-              const fx = (dx / distance) * force;
-              const fy = (dy / distance) * force;
-              
-              // Apply force to all nodes in each component
-              simNodes.forEach(n => {
-                const compIdx = ipToComponent.get(n.id) || -1;
-                if (compIdx === compA) {
-                  n.vx = (n.vx || 0) - fx / componentCounts.get(compA);
-                  n.vy = (n.vy || 0) - fy * 3.0 / componentCounts.get(compA); // Stronger vertical separation
-                } else if (compIdx === compB) {
-                  n.vx = (n.vx || 0) + fx / componentCounts.get(compB);
-                  n.vy = (n.vy || 0) + fy * 3.0 / componentCounts.get(compB);
-                }
-              });
-            }
-          }
-        }
-        
-        // Also apply individual node-level separation for nodes near component boundaries
-        for (let i = 0; i < simNodes.length; i++) {
-          const nodeA = simNodes[i];
-          const compA = ipToComponent.get(nodeA.id) || -1;
-          
-          for (let j = i + 1; j < simNodes.length; j++) {
-            const nodeB = simNodes[j];
-            const compB = ipToComponent.get(nodeB.id) || -1;
-            
-            // Only apply separation force between nodes in different components
-            if (compA !== compB) {
-              const dx = (nodeB.x || 0) - (nodeA.x || 0);
-              const dy = (nodeB.y || 0) - (nodeA.y || 0);
-              const distanceSquared = dx * dx + dy * dy;
-              const distance = Math.sqrt(distanceSquared) || 1;
-              
-              // Stronger repulsion for nodes in different components
-              if (distance < minDistance * 1.5 && distance > 0) {
-                const force = (minDistance * 1.5 - distance) / distance * separationStrength * alpha * 0.5;
-                const fx = (dx / distance) * force;
-                const fy = (dy / distance) * force;
-                
-                // Apply stronger vertical separation
-                const verticalBoost = 4.0;
-                nodeA.vx = (nodeA.vx || 0) - fx;
-                nodeA.vy = (nodeA.vy || 0) - fy * verticalBoost;
-                nodeB.vx = (nodeB.vx || 0) + fx;
-                nodeB.vy = (nodeB.vy || 0) + fy * verticalBoost;
-              }
-            }
-          }
-        }
-      };
-      
-      // Component cohesion force: keeps nodes within their component together
-      const componentCohesionForce = (alpha) => {
-        const cohesionStrength = 0.3;
-        
-        // Compute component centroids
-        const componentCentroids = new Map();
-        const componentCounts = new Map();
-        simNodes.forEach(n => {
-          const compIdx = ipToComponent.get(n.id) || -1;
-          if (!componentCentroids.has(compIdx)) {
-            componentCentroids.set(compIdx, { x: 0, y: 0 });
-            componentCounts.set(compIdx, 0);
-          }
-          const centroid = componentCentroids.get(compIdx);
-          centroid.x += n.x || 0;
-          centroid.y += n.y || 0;
-          componentCounts.set(compIdx, componentCounts.get(compIdx) + 1);
-        });
-        
-        // Normalize centroids
-        componentCentroids.forEach((centroid, compIdx) => {
-          const count = componentCounts.get(compIdx);
-          if (count > 0) {
-            centroid.x /= count;
-            centroid.y /= count;
-          }
-        });
-        
-        // Attract nodes to their component centroid
-        simNodes.forEach(n => {
-          const compIdx = ipToComponent.get(n.id) || -1;
-          const centroid = componentCentroids.get(compIdx);
-          if (centroid) {
-            const dx = centroid.x - (n.x || 0);
-            const dy = centroid.y - (n.y || 0);
-            const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-            
-            // Only apply if node is far from centroid (to allow internal structure)
-            if (distance > 20) {
-              const force = Math.min(distance / 50, 1) * cohesionStrength * alpha;
-              n.vx = (n.vx || 0) + (dx / distance) * force;
-              n.vy = (n.vy || 0) + (dy / distance) * force;
-            }
-          }
-        });
-      };
-      
-      // Hub centering force: pulls the highest-degree IP in each component to the vertical center
-      const hubCenteringForce = (alpha) => {
-        const hubStrength = 2.0; // Strong force to center hubs
-        
-        componentHubIps.forEach((hubIp, compIdx) => {
-          const hubNode = simNodes.find(n => n.id === hubIp);
-          if (!hubNode) return;
-          
-          const targetY = componentCenters.get(compIdx);
-          if (targetY === undefined) return;
-          
-          // Calculate current Y position
-          const currentY = hubNode.y || targetY;
-          const dy = targetY - currentY;
-          
-          // Apply strong vertical force to pull hub toward component center
-          // Use a stronger force that scales with distance for better convergence
-          const distance = Math.abs(dy);
-          if (distance > 0.1) { // Only apply if not already centered
-            const force = hubStrength * alpha * Math.min(distance / 50, 1);
-            hubNode.vy = (hubNode.vy || 0) + (dy > 0 ? force : -force);
-          }
-        });
-      };
+      // Use imported force functions
+      const componentSeparationForce = createComponentSeparationForce(ipToComponent, simNodes);
+      const componentCohesionForce = createComponentCohesionForce(ipToComponent, simNodes);
+      const hubCenteringForce = createHubCenteringForce(componentHubIps, componentCenters, simNodes);
       
       // Register the custom forces with the simulation
       simulation.force('componentSeparation', componentSeparationForce);
@@ -1521,39 +1011,7 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       
       // Stage 2: Reduce component forces and allow internal optimization
       simulation.force('y').strength(0.4); // Reduce Y force strength
-      simulation.force('componentSeparation', (alpha) => {
-        // Weaker separation in stage 2
-        const separationStrength = 0.3;
-        const minDistance = 50;
-        
-        for (let i = 0; i < simNodes.length; i++) {
-          const nodeA = simNodes[i];
-          const compA = ipToComponent.get(nodeA.id) || -1;
-          
-          for (let j = i + 1; j < simNodes.length; j++) {
-            const nodeB = simNodes[j];
-            const compB = ipToComponent.get(nodeB.id) || -1;
-            
-            if (compA !== compB) {
-              const dx = (nodeB.x || 0) - (nodeA.x || 0);
-              const dy = (nodeB.y || 0) - (nodeA.y || 0);
-              const distance = Math.sqrt(dx * dx + dy * dy) || 1;
-              
-              if (distance < minDistance && distance > 0) {
-                const force = (minDistance - distance) / distance * separationStrength * alpha;
-                const fx = (dx / distance) * force;
-                const fy = (dy / distance) * force;
-                
-                const verticalBoost = 2.0;
-                nodeA.vx = (nodeA.vx || 0) - fx;
-                nodeA.vy = (nodeA.vy || 0) - fy * verticalBoost;
-                nodeB.vx = (nodeB.vx || 0) + fx;
-                nodeB.vy = (nodeB.vy || 0) + fy * verticalBoost;
-              }
-            }
-          }
-        }
-      });
+      simulation.force('componentSeparation', createWeakComponentSeparationForce(ipToComponent, simNodes));
       
       // Continue simulation for internal optimization
       simulation.alpha(0.15).restart();
@@ -1562,20 +1020,10 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       // Single component: use original positioning
       const componentCenter = (MARGIN.top + INNER_HEIGHT) / 2;
       
-      // Find hub IP for single component
-      let hubIp = null;
-      if (components.length === 1 && components[0]) {
-        let maxDegree = -1;
-        components[0].forEach(ip => {
-          const degree = ipDegree.get(ip) || 0;
-          if (degree > maxDegree) {
-            maxDegree = degree;
-            hubIp = ip;
-          }
-        });
-        if (hubIp) {
-          console.log(`Single component hub IP: ${hubIp} (degree: ${maxDegree})`);
-        }
+      // Find hub IP for single component using the already computed componentHubIps
+      const hubIp = componentHubIps.get(0) || null;
+      if (hubIp) {
+        console.log(`Single component hub IP: ${hubIp} (degree: ${ipDegree.get(hubIp) || 0})`);
       }
       
       // Sort nodes deterministically by degree (descending), then by IP string
@@ -1604,20 +1052,9 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       
       // Add hub centering force for single component
       if (hubIp) {
-        const hubCenteringForce = (alpha) => {
-          const hubStrength = 1.0;
-          const hubNode = simNodes.find(n => n.id === hubIp);
-          if (hubNode) {
-            const currentY = hubNode.y || componentCenter;
-            const dy = componentCenter - currentY;
-            const distance = Math.abs(dy);
-            if (distance > 0.1) {
-              const force = hubStrength * alpha * Math.min(distance / 50, 1);
-              hubNode.vy = (hubNode.vy || 0) + (dy > 0 ? force : -force);
-            }
-          }
-        };
-        simulation.force('hubCentering', hubCenteringForce);
+        const singleComponentCenters = new Map([[0, componentCenter]]);
+        const singleHubIps = new Map([[0, hubIp]]);
+        simulation.force('hubCentering', createHubCenteringForce(singleHubIps, singleComponentCenters, simNodes, { hubStrength: 1.0 }));
       }
       
       // Run simulation for single component
@@ -1705,6 +1142,7 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
 
     // Update x-scale range to fit arcs within viewport
     const actualXEnd = svgWidth - MARGIN.right - actualMaxArcRadius;
+    currentXEnd = actualXEnd; // Update the dynamic xEnd for xScaleLens
     x.range([xStart, actualXEnd]);
 
     // Update axis to match new x-scale
@@ -1722,7 +1160,7 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
         return `t=${relUnits}${unitSuffix}`;
       }));
 
-    const finalSpanData = sortedIps.map(ip => ({ ip, span: ipSpans.get(ip) }));
+    const finalSpanData = createSpanData(sortedIps, ipSpans);
     
     // Animate everything to timeline (with correct final alignment)
     // Update lines - rebind to sorted data
@@ -2097,210 +1535,29 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
         originalRowPositions.set(ip, currentY);
       });
 
-      // Create custom fisheye scale since D3 fisheye plugin may not be compatible with v7
-      // We'll implement a simple Cartesian distortion function
-      fisheyeScale = {
-        _focus: MARGIN.top + INNER_HEIGHT / 2,
-        _distortion: fisheyeDistortion,
-        _domain: [0, ipsToUse.length - 1],
-        _range: [MARGIN.top, MARGIN.top + INNER_HEIGHT],
-        _sortedIps: ipsToUse, // Store the sorted order
+      // Create vertical fisheye scale using imported factory
+      fisheyeScale = createFisheyeScale({
+        sortedIps: ipsToUse,
+        originalPositions: originalRowPositions,
+        marginTop: MARGIN.top,
+        innerHeight: INNER_HEIGHT,
+        getDistortion: () => fisheyeDistortion
+      });
 
-        focus: function(f) {
-          this._focus = f;
-          return this;
-        },
-
-        distortion: function(d) {
-          if (arguments.length === 0) return this._distortion;
-          this._distortion = d;
-          return this;
-        },
-
-        // Apply fisheye distortion to an IP address
-        // This implementation maintains monotonicity (order preservation)
-        apply: function(ip) {
-          const sortedList = this._sortedIps;
-          if (!sortedList || sortedList.length === 0) return MARGIN.top;
-
-          // Find index of this IP in the sorted list
-          const idx = sortedList.indexOf(ip);
-          if (idx === -1) {
-            // IP not in sorted list, return original position
-            return originalRowPositions.get(ip) || MARGIN.top;
-          }
-
-          // Get original Y position from stored positions
-          const originalY = originalRowPositions.get(ip);
-          if (!originalY) return MARGIN.top;
-
-          // Normalize original Y position to [0, 1] based on actual screen position
-          const t = (originalY - MARGIN.top) / INNER_HEIGHT;
-
-          // Normalize focus to [0, 1]
-          const focusY = this._focus;
-          const focusT = (focusY - MARGIN.top) / INNER_HEIGHT;
-
-          const distortion = this._distortion;
-
-          // Calculate the distorted position using a smooth fisheye function
-          // that preserves monotonicity
-          const distortedT = this.fisheyeDistortion(t, focusT, distortion);
-
-          return MARGIN.top + distortedT * INNER_HEIGHT;
-        },
-
-        // Fisheye distortion function that keeps the focus point fixed
-        // Simple formula: multiply distance by distortion factor near focus
-        fisheyeDistortion: function(t, focus, distortion) {
-          if (distortion <= 1) return t;
-
-          // Distance from focus point
-          const delta = t - focus;
-          const distance = Math.abs(delta);
-          const sign = delta < 0 ? -1 : 1;
-
-          if (distance < 0.0001) {
-            // At the focus point, no distortion
-            return t;
-          }
-
-          // Fisheye effect: points near focus expand, far points compress
-          // Use a smooth falloff based on distance
-          const effectRadius = 0.5; // Half the range is affected
-
-          // Calculate how much to magnify based on distance from focus
-          // Close to focus: multiply by distortion (expand)
-          // Far from focus: divide by distortion (compress)
-          let scale;
-          if (distance < effectRadius) {
-            // Inside radius: interpolate from distortion (at focus) to 1 (at radius edge)
-            const normalized = distance / effectRadius;
-            // Use cosine for smooth interpolation
-            const blend = (1 - Math.cos(normalized * Math.PI)) / 2;
-            scale = distortion - (distortion - 1) * blend;
-          } else {
-            // Outside radius: compress more as we go further
-            const excessDistance = distance - effectRadius;
-            const compressionFactor = 1 / distortion;
-            scale = 1 - (1 - compressionFactor) * Math.min(1, excessDistance / (1 - effectRadius));
-          }
-
-          // Apply the scale to the distance
-          const distorted = focus + sign * distance * scale;
-          return Math.max(0, Math.min(1, distorted));
-        }
-      };
+      // Create horizontal fisheye scale using imported factory
+      horizontalFisheyeScale = createHorizontalFisheyeScale({
+        xStart,
+        xEnd: currentXEnd,
+        tsMin,
+        tsMax,
+        getDistortion: () => fisheyeDistortion
+      });
 
       console.log('Fisheye initialized:', {
         numIps: ipsToUse.length,
         focus: fisheyeScale._focus,
         distortion: fisheyeDistortion,
         sampleOriginalPositions: Array.from(originalRowPositions.entries()).slice(0, 3)
-      });
-
-      // Create horizontal fisheye scale for timeline distortion
-      horizontalFisheyeScale = {
-        _focus: xStart + (xEnd - xStart) / 2, // Middle of timeline
-        _distortion: fisheyeDistortion,
-        _xStart: xStart,
-        _xEnd: xEnd,
-        _tsMin: tsMin,
-        _tsMax: tsMax,
-
-        focus: function(f) {
-          this._focus = f;
-          return this;
-        },
-
-        distortion: function(d) {
-          if (arguments.length === 0) return this._distortion;
-          this._distortion = d;
-          return this;
-        },
-
-        // Apply horizontal fisheye distortion to a timestamp
-        apply: function(timestamp) {
-          const xStart = this._xStart;
-          const xEnd = this._xEnd;
-          const tsMin = this._tsMin;
-          const tsMax = this._tsMax;
-          const totalWidth = xEnd - xStart;
-
-          if (totalWidth <= 0 || tsMax === tsMin) {
-            return xStart;
-          }
-
-          // Convert timestamp to normalized position [0, 1]
-          const t = (timestamp - tsMin) / (tsMax - tsMin);
-
-          // Apply fisheye distortion
-          const focusX = this._focus;
-          const focusT = (focusX - xStart) / totalWidth;
-          const distortion = this._distortion;
-
-          const distortedT = this.fisheyeDistortion(t, focusT, distortion);
-
-          return xStart + distortedT * totalWidth;
-        },
-
-        // Fisheye distortion function that preserves monotonicity
-        // Maps normalized time [0,1] to distorted normalized position [0,1]
-        // Ensures order is preserved: if t1 < t2, then distorted(t1) < distorted(t2)
-        fisheyeDistortion: function(t, focus, distortion) {
-          if (distortion <= 1) return t;
-
-          // Clamp input to valid range
-          t = Math.max(0, Math.min(1, t));
-          focus = Math.max(0, Math.min(1, focus));
-
-          // Effect radius around focus (fraction of total range)
-          const effectRadius = 0.15; // 15% on each side of focus = 30% total magnified region
-
-          // Define regions: [0, focusLeft], [focusLeft, focusRight], [focusRight, 1]
-          const focusLeft = Math.max(0, focus - effectRadius);
-          const focusRight = Math.min(1, focus + effectRadius);
-
-          // Calculate how much space each region should occupy after distortion
-          // The magnified region expands, other regions compress to compensate
-          const magnifiedWidth = focusRight - focusLeft;
-          const leftWidth = focusLeft;
-          const rightWidth = 1 - focusRight;
-
-          // Total "virtual" width if we expand magnified region by distortion factor
-          const virtualWidth = leftWidth + magnifiedWidth * distortion + rightWidth;
-
-          // Normalize back to [0,1] range - each region gets proportional space
-          const leftTargetWidth = leftWidth / virtualWidth;
-          const magnifiedTargetWidth = (magnifiedWidth * distortion) / virtualWidth;
-          const rightTargetWidth = rightWidth / virtualWidth;
-
-          // Map t to output position based on which region it's in
-          if (t <= focusLeft) {
-            // Left region: compress linearly
-            if (leftWidth === 0) return 0;
-            const localT = t / leftWidth; // Normalize to [0,1] within region
-            return localT * leftTargetWidth;
-          } else if (t <= focusRight) {
-            // Magnified region: expand linearly
-            if (magnifiedWidth === 0) return leftTargetWidth;
-            const localT = (t - focusLeft) / magnifiedWidth; // Normalize to [0,1] within region
-            return leftTargetWidth + localT * magnifiedTargetWidth;
-          } else {
-            // Right region: compress linearly
-            if (rightWidth === 0) return leftTargetWidth + magnifiedTargetWidth;
-            const localT = (t - focusRight) / rightWidth; // Normalize to [0,1] within region
-            return leftTargetWidth + magnifiedTargetWidth + localT * rightTargetWidth;
-          }
-        }
-      };
-
-      console.log('Horizontal fisheye initialized:', {
-        xStart,
-        xEnd,
-        tsMin,
-        tsMax,
-        distortion: fisheyeDistortion
       });
     }
 
@@ -2786,34 +2043,8 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
         components.map((comp, idx) => `Component ${idx}: ${comp.length} nodes`).join(', '));
     }
 
-    // Don't run simulation here - we'll run it visually during render
-    // Just initialize the simulation with parameters similar to main.js for natural clustering
-    // The simulation will be configured during render with component-specific forces
-    // Note: We set initial positions during render to ensure deterministic behavior
-    // Using weaker parameters like main.js: charge(-12), linkDistance(0), gravity(0.01), alpha(0.05)
-    // Friction 0.9 in main.js => velocityDecay(0.1) in d3 v4+
-    const sim = d3.forceSimulation(simNodes)
-      .force('link', d3.forceLink(simLinks).id(d=>d.id).strength(1.0).distance(0)) // Match main.js: Strong links, distance 0
-      .force('charge', d3.forceManyBody().strength(-12)) // Match main.js: charge(-12)
-      .force('x', d3.forceX(0).strength(0.01)) // Match main.js: gravity(0.01)
-      //.force('collision', d3.forceCollide().radius(12).strength(0.5)) // Match main.js: No collision
-      .alpha(0.05) // Match main.js: alpha(0.05)
-      .alphaDecay(0.02) 
-      .velocityDecay(0.1) // Match main.js: friction 0.9 => velocityDecay 0.1
-      .stop();
-    
-    // Initialize all nodes with deterministic positions to avoid D3's random initialization
-    // These will be overridden during render, but this ensures no randomness
-    simNodes.forEach((n, i) => {
-      if (n.x === undefined) n.x = 0;
-      if (n.y === undefined) n.y = 0;
-      if (n.vx === undefined) n.vx = 0;
-      if (n.vy === undefined) n.vy = 0;
-    });
-    
-    // Store component info for use during render
-    sim._components = components;
-    sim._ipToComponent = ipToComponent;
+    // Return raw data for simulation - simulation will be created in render()
+    // using the imported createForceSimulation function
     
     // Initialize empty yMap - will be populated during render
     const yMap = new Map();
@@ -2868,124 +2099,15 @@ import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
       arr.sort((a,b)=> (yMap.get(a)||0) - (yMap.get(b)||0));
       for (const ip of arr) nodes.push({ name: ip, group: g });
     }
-    return { nodes, simulation: sim, simNodes, yMap };
+    return { nodes, simNodes, simLinks, yMap, components, ipToComponent };
   }
 
   // Wrapper for decodeIp that provides global maps
   const _decodeIp = (value) => decodeIp(value, ipIdToAddr);
-
-  async function loadIpMap() {
-    try {
-      const res = await fetch('./full_ip_map.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const obj = await res.json();
-      // obj: { ipString: idNumber }
-      const rev = new Map();
-      let count = 0;
-      for (const [ip, id] of Object.entries(obj)) {
-        const num = Number(id);
-        if (Number.isFinite(num)) {
-          rev.set(num, ip);
-          count++;
-        }
-      }
-      ipIdToAddr = rev;
-      ipMapLoaded = true;
-      setStatus(statusEl,`IP map loaded (${count} entries). Upload CSV to render.`);
-    } catch (err) {
-      console.warn('Failed to load full_ip_map.json; will display raw values.', err);
-      ipIdToAddr = null;
-      ipMapLoaded = false;
-      // Leave status untouched if user is already loading data; otherwise hint.
-      if (statusEl && (!statusEl.textContent || /Waiting/i.test(statusEl.textContent))) {
-        setStatus(statusEl,'full_ip_map.json not loaded. Raw src/dst will be shown.');
-      }
-    }
-  }
 
   // Wrapper functions for decoders that provide global maps
   const _decodeAttack = (value) => decodeAttack(value, attackIdToName);
   const _decodeAttackGroup = (groupVal, fallbackVal) => decodeAttackGroup(groupVal, fallbackVal, attackGroupIdToName, attackIdToName);
   const _lookupAttackColor = (name) => lookupAttackColor(name, rawColorByAttack, colorByAttack);
   const _lookupAttackGroupColor = (name) => lookupAttackGroupColor(name, rawColorByAttackGroup, colorByAttackGroup);
-
-  async function loadEventTypeMap() {
-    try {
-      const res = await fetch('./event_type_mapping.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const obj = await res.json(); // name -> id
-      const rev = new Map();
-      for (const [name, id] of Object.entries(obj)) {
-        const num = Number(id);
-        if (Number.isFinite(num)) rev.set(num, name);
-      }
-      attackIdToName = rev;
-    } catch (err) {
-      console.warn('Failed to load event_type_mapping.json; attacks will show raw values.', err);
-      attackIdToName = null;
-    }
-  }
-
-  async function loadColorMapping() {
-    try {
-      const res = await fetch('./color_mapping.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const obj = await res.json(); // name -> color
-      rawColorByAttack = new Map(Object.entries(obj));
-      colorByAttack = new Map();
-      for (const [name, col] of Object.entries(obj)) {
-        colorByAttack.set(canonicalizeName(name), col);
-      }
-    } catch (err) {
-      console.warn('Failed to load color_mapping.json; default colors will be used.', err);
-      colorByAttack = null;
-      rawColorByAttack = null;
-    }
-  }
-
-  async function loadAttackGroupMap() {
-    try {
-      const res = await fetch('./attack_group_mapping.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const obj = await res.json(); // name -> id or id -> name
-      const entries = Object.entries(obj);
-      const rev = new Map();
-      if (entries.length) {
-        let nameToId = 0, idToName = 0;
-        for (const [k,v] of entries.slice(0,10)) {
-          if (typeof v === 'number') nameToId++;
-          if (!isNaN(+k) && typeof v === 'string') idToName++;
-        }
-        if (nameToId >= idToName) {
-          for (const [name,id] of entries) {
-            const num = Number(id); if (Number.isFinite(num)) rev.set(num, name);
-          }
-        } else {
-          for (const [idStr,name] of entries) {
-            const num = Number(idStr); if (Number.isFinite(num) && typeof name === 'string') rev.set(num, name);
-          }
-        }
-      }
-      attackGroupIdToName = rev;
-    } catch (err) {
-      console.warn('Failed to load attack_group_mapping.json; attack groups may show raw values.', err);
-      attackGroupIdToName = null;
-    }
-  }
-
-  async function loadAttackGroupColorMapping() {
-    try {
-      const res = await fetch('./attack_group_color_mapping.json', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const obj = await res.json(); // name -> color
-      rawColorByAttackGroup = new Map(Object.entries(obj));
-      colorByAttackGroup = new Map();
-      for (const [name,col] of Object.entries(obj)) {
-        colorByAttackGroup.set(canonicalizeName(name), col);
-      }
-    } catch (err) {
-      console.warn('Failed to load attack_group_color_mapping.json; default colors will be used for groups.', err);
-      colorByAttackGroup = null; rawColorByAttackGroup = null;
-    }
-  }
 })();
