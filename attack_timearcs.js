@@ -11,6 +11,7 @@ import { applyLens1D, createLensXScale, createFisheyeScale, createHorizontalFish
 import { computeIpSpans, createSpanData, renderRowLines, renderIpLabels, createLabelHoverHandler, createLabelMoveHandler, createLabelLeaveHandler, attachLabelHoverHandlers } from './src/rendering/rows.js';
 import { createArcHoverHandler, createArcMoveHandler, createArcLeaveHandler, attachArcHandlers } from './src/rendering/arcInteractions.js';
 import { loadAllMappings } from './src/mappings/loaders.js';
+import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from './src/interaction/resize.js';
 
 // Network TimeArcs visualization
 // Input CSV schema: timestamp,length,src_ip,dst_ip,protocol,count
@@ -163,6 +164,11 @@ import { loadAllMappings } from './src/mappings/loaders.js';
   let updateLensVisualizationFn = null;
   // Reference to toggleLensing function so button can trigger it
   let toggleLensingFn = null;
+  
+  // State for last rendered data (for resize re-render)
+  let lastRenderedData = null;
+  // Cleanup function for resize handler
+  let resizeCleanup = null;
 
   // Initialize mappings, then try a default CSV load
   (async function init() {
@@ -183,9 +189,60 @@ import { loadAllMappings } from './src/mappings/loaders.js';
     } catch (err) {
       console.warn('Mapping load failed:', err);
     }
+    // Setup window resize handler
+    resizeCleanup = setupWindowResizeHandler();
     // After maps are ready (or failed gracefully), try default CSV
     tryLoadDefaultCsv();
   })();
+  
+  // Window resize handler for responsive visualization
+  function setupWindowResizeHandler() {
+    const handleResizeLogic = () => {
+      try {
+        // Only proceed if we have data to re-render
+        if (!lastRenderedData || lastRenderedData.length === 0) {
+          return;
+        }
+        
+        console.log('Handling window resize, updating visualization dimensions');
+        
+        // Store old dimensions for comparison
+        const oldWidth = width;
+        const oldHeight = height;
+        
+        const containerEl = document.getElementById('chart-container');
+        if (!containerEl) return;
+        
+        // Calculate new dimensions
+        const containerRect = containerEl.getBoundingClientRect();
+        const availableWidth = containerRect.width || 1200;
+        const viewportWidth = Math.max(availableWidth, 800);
+        const newWidth = viewportWidth - MARGIN.left - MARGIN.right;
+        
+        // Skip if dimensions haven't changed significantly
+        if (Math.abs(newWidth - oldWidth) < 10) {
+          return;
+        }
+        
+        console.log(`Resize: ${oldWidth}x${oldHeight} -> ${newWidth}x${height}`);
+        
+        // Re-render with the new dimensions
+        // The render function will recalculate all scales and positions
+        render(lastRenderedData);
+        
+        console.log('Window resize handling complete');
+        
+      } catch (e) {
+        console.warn('Error during window resize:', e);
+      }
+    };
+    
+    // Use module's resize handler with our custom logic
+    return setupWindowResizeHandlerFromModule({
+      debounceMs: 200,
+      onResize: handleResizeLogic
+    });
+  }
 
   // Stream-parse a CSV file incrementally to avoid loading entire file into memory
   // Pushes transformed rows directly into combinedData, returns {totalRows, validRows}
@@ -557,6 +614,9 @@ import { loadAllMappings } from './src/mappings/loaders.js';
   }
 
   function render(data) {
+    // Store data for resize re-render
+    lastRenderedData = data;
+    
     // Determine timestamp handling
     const tsMin = d3.min(data, d => d.timestamp);
     const tsMax = d3.max(data, d => d.timestamp);

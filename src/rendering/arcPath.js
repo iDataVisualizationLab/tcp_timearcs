@@ -1,6 +1,9 @@
 // src/rendering/arcPath.js
 // Arc path generation
 
+import { FLAG_CURVATURE } from '../config/constants.js';
+import { classifyFlags } from '../tcp/flags.js';
+
 /**
  * Generate SVG arc path for a link.
  * @param {Object} d - Link with source/target having x/y properties
@@ -31,4 +34,54 @@ export function gradientIdForLink(d, sanitizeId) {
   const src = d.sourceIp || (typeof d.source === 'string' ? d.source : d.source?.name);
   const tgt = d.targetIp || (typeof d.target === 'string' ? d.target : d.target?.name);
   return `grad-${sanitizeId(`${src}__${tgt}__${d.minute}`)}`;
+}
+
+// === Bar Diagram Arc Generator ===
+
+/**
+ * Generate curved arc path for bar diagram visualization.
+ * Uses flag-based curvature to distinguish different packet types.
+ * @param {Object} d - Packet data with timestamp, src_ip, dst_ip, flags
+ * @param {Object} options - {xScale, ipPositions, pairs, findIPPosition, flagCurvature}
+ * @returns {string} SVG path string
+ */
+export function arcPathGenerator(d, options) {
+    const {
+        xScale,
+        ipPositions,
+        pairs,
+        findIPPosition,
+        flagCurvature = FLAG_CURVATURE
+    } = options;
+
+    if (!xScale || !ipPositions) return "";
+
+    const timestampInt = Math.floor(d.timestamp);
+    const x = xScale(timestampInt);
+    const y1 = findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions);
+    const y2 = findIPPosition(d.dst_ip, d.src_ip, d.dst_ip, pairs, ipPositions);
+
+    if (y1 === 0 || y2 === 0 || y1 === y2) return "";
+
+    // Curvature by TCP flag type (pixels of horizontal offset)
+    const flagType = classifyFlags(d.flags);
+    const base = (flagCurvature[flagType] !== undefined) ? flagCurvature[flagType] : flagCurvature.OTHER;
+    const vert = Math.abs(y2 - y1);
+
+    // Scale curvature slightly with vertical distance so long arcs remain visible
+    const scale = Math.min(1, vert / 200);
+    const dx = base * (0.5 + 0.5 * scale);
+
+    // If no curvature for this flag, draw straight line
+    if (dx <= 0) {
+        return `M${x},${y1} L${x},${y2}`;
+    }
+
+    // Curve everything to the right regardless of direction
+    const cx1 = x + dx;
+    const cy1 = y1;
+    const cx2 = x + dx;
+    const cy2 = y2;
+
+    return `M${x},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x},${y2}`;
 }

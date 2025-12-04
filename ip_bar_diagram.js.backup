@@ -4,121 +4,74 @@ import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList a
 import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, drawFlagLegend as drawFlagLegendFromModule } from './legends.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
 import { GLOBAL_BIN_COUNT, FLOW_RECONSTRUCT_BATCH } from './config.js';
-import {
-    DEBUG, RADIUS_MIN, RADIUS_MAX, ROW_GAP, TOP_PAD,
-    TCP_STATES, HANDSHAKE_TIMEOUT_MS, REORDER_WINDOW_PKTS, REORDER_WINDOW_MS,
-    DEFAULT_FLAG_COLORS, FLAG_CURVATURE, PROTOCOL_MAP,
-    DEFAULT_FLOW_COLORS, DEFAULT_EVENT_COLORS
-} from './src/config/constants.js';
-import {
-    LOG, formatBytes, formatTimestamp, formatDuration,
-    utcToEpochMicroseconds, epochMicrosecondsToUTC,
-    makeConnectionKey, clamp, normalizeProtocolValue
-} from './src/utils/formatters.js';
-import {
-    classifyFlags, flagPhase, isFlagVisibleByPhase,
-    has, isSYN, isSYNACK, isACKonly,
-    getColoredFlagBadges, getTopFlags
-} from './src/tcp/flags.js';
-import {
-    calculateZoomLevel, getBinSize, getVisiblePackets,
-    binPackets, computeBarWidthPx, getEffectiveBinCount
-} from './src/data/binning.js';
-import {
-    reconstructFlowsFromCSVAsync,
-    reconstructFlowsFromCSV,
-    buildSelectedFlowKeySet as buildSelectedFlowKeySetFromModule,
-    verifyFlowPacketConnection,
-    exportFlowToCSV as exportFlowToCSVFromModule
-} from './src/data/flowReconstruction.js';
-import { renderCircles } from './src/rendering/circles.js';
-import { renderBars, renderMarksForLayer } from './src/rendering/bars.js';
-import { createTooltipHTML } from './src/rendering/tooltip.js';
-import { arcPathGenerator } from './src/rendering/arcPath.js';
-import {
-    buildForceLayoutData,
-    computeForceLayoutPositions as computeForceLayoutPositionsBase,
-    applyForceLayoutPositions as applyForceLayoutPositionsBase
-} from './src/layout/barForceLayout.js';
-import { createZoomBehavior, applyZoomDomain as applyZoomDomainFromModule } from './src/interaction/zoom.js';
-import { createDragReorderBehavior } from './src/interaction/dragReorder.js';
-import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from './src/interaction/resize.js';
-import {
-    loadGroundTruthData,
-    filterGroundTruthByIPs,
-    prepareGroundTruthBoxData,
-    calculateGroundTruthStats
-} from './src/groundTruth/groundTruth.js';
-import {
-    createPacketWorkerManager,
-    applyVisibilityToDots
-} from './src/workers/packetWorkerManager.js';
 
+// Global debug flag to silence heavy logs in production
+const DEBUG = false;
+// Unified debug logger; usage: LOG('message', optionalData)
+function LOG(...args) { if (DEBUG) console.log(...args); }
 // --- Web Worker for packet filtering ---
-let workerManager = null;
+let packetWorker = null;
+let packetWorkerReady = false;
+let lastWorkerVersion = 0;
+let pendingFilterRequest = null;
+let workerVisibilityMask = null; // Uint8Array bitmask for packet visibility
 
-function initializeWorkerManager() {
-    workerManager = createPacketWorkerManager({
-        onVisibilityApplied: (mask) => {
-            if (!mainGroup) {
-                console.warn('Worker visibility applied but mainGroup not available');
-                return;
+function initPacketWorker() {
+    if (packetWorker) return;
+    try {
+        packetWorker = new Worker('packet_worker.js');
+        packetWorker.onmessage = (e) => {
+            const msg = e.data;
+            switch (msg.type) {
+                case 'ready':
+                    packetWorkerReady = true;
+                    lastWorkerVersion = msg.version || 0;
+                    if (DEBUG) console.log('[Worker] Ready. packets=', msg.packetCount);
+                    if (pendingFilterRequest) {
+                        packetWorker.postMessage(pendingFilterRequest);
+                        pendingFilterRequest = null;
+                    }
+                    break;
+                case 'filtered':
+                    if ((msg.version || 0) < lastWorkerVersion) return; // stale
+                    lastWorkerVersion = msg.version || lastWorkerVersion;
+                    workerVisibilityMask = msg.visible; // transferred Uint8Array
+                    applyVisibilityToDots(workerVisibilityMask);
+                    break;
+                case 'error':
+                    console.error('[Worker] error:', msg.message);
+                    break;
             }
-            const dots = mainGroup.selectAll('.direction-dot').nodes();
-            if (DEBUG && dots.length !== mask.length) {
-                console.warn(`Worker mask/dots mismatch: mask=${mask.length}, dots=${dots.length}. This may indicate DOM was updated after worker init.`);
-            }
-            applyVisibilityToDots(mask, dots, {
-                onComplete: () => {
-                    try { applyInvalidReasonFilter(); } catch(_) {}
-                }
-            });
-        },
-        onError: (error) => {
-            console.error('Worker error, falling back to legacy filtering:', error);
-            legacyFilterPacketsBySelectedFlows();
-        }
-    });
-}
-
-function reinitializeWorkerIfNeeded(packets) {
-    if (workerManager && packets) {
-        try {
-            workerManager.initPackets(packets);
-        } catch (err) {
-            console.error('Failed to reinitialize worker:', err);
-            legacyFilterPacketsBySelectedFlows();
-        }
+        };
+        packetWorker.onerror = (err) => console.error('[Worker] onerror', err);
+    } catch (err) {
+        console.error('Failed creating worker', err);
     }
 }
 
-function syncWorkerWithRenderedData() {
-    if (!workerManager || !mainGroup) return;
-    
-    // Get currently rendered dots data
+function applyVisibilityToDots(mask) {
+    if (!mask || !mainGroup) return;
     const dots = mainGroup.selectAll('.direction-dot');
-    const renderedData = [];
-    
-    dots.each(function(d) {
-        if (d) {
-            // Extract the data bound to each DOM element
-            renderedData.push({
-                src_ip: d.src_ip,
-                dst_ip: d.dst_ip,
-                src_port: d.src_port,
-                dst_port: d.dst_port,
-                _packetIndex: renderedData.length // Use array index as packet index
-            });
+    const nodes = dots.nodes();
+    if (nodes.length !== mask.length) {
+        if (DEBUG) console.warn('Mask length mismatch; fallback', mask.length, nodes.length);
+        legacyFilterPacketsBySelectedFlows();
+        return;
+    }
+    const BATCH = 4000;
+    function batch(start) {
+        const end = Math.min(nodes.length, start + BATCH);
+        for (let i = start; i < end; i++) {
+            const n = nodes[i];
+            n.style.display = mask[i] === 1 ? '' : 'none';
         }
-    });
-    
-    if (renderedData.length > 0) {
-        try {
-            workerManager.initPackets(renderedData);
-        } catch (err) {
-            console.error('Failed to sync worker with rendered data:', err);
+        if (end < nodes.length) {
+            requestAnimationFrame(() => batch(end));
+        } else {
+            try { applyInvalidReasonFilter(); } catch(_) {}
         }
     }
+    requestAnimationFrame(() => batch(0));
 }
 let fullData = [];
 let filteredData = [];
@@ -146,6 +99,9 @@ let timeExtent = [0, 0]; // Global time extent for the dataset
 let pairs = new Map(); // Global pairs map for IP pairing system
 let ipPositions = new Map(); // Global IP positions map
 let ipOrder = []; // Current vertical order of IPs
+// Row layout constants (used for positioning and drag-reorder)
+const ROW_GAP = 50; // vertical gap between IP rows
+const TOP_PAD = 30; // top padding before first row
 
 // Force layout for IP positioning
 let forceLayout = null;
@@ -171,7 +127,10 @@ let dataVersion = 0; // increment when filteredData changes
 let fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false };
 // Global radius scaling: anchor sizes across zooms
 // - RADIUS_MIN: circle size for an individual packet (count = 1)
+// - RADIUS_MAX: circle size for the largest bin observed at full zoom-out
 // - globalMaxBinCount: computed from the initial full-domain binning; reused at all zoom levels
+const RADIUS_MIN = 3;
+const RADIUS_MAX = 30;
 let globalMaxBinCount = 1;
 
 // User toggle: binning on/off
@@ -179,25 +138,167 @@ let useBinning = true;
 // Render mode: 'circles' (default) or 'bars'
 let renderMode = 'circles';
 
-// Wrapper to call imported renderBars with required options
-function renderBarsWithOptions(layer, binned) {
-    renderBars(layer, binned, {
-        xScale,
-        flagColors,
-        globalMaxBinCount,
-        ROW_GAP,
-        formatBytes,
-        formatTimestamp,
-        d3
-    });
+// Choose the effective bin count based on render mode and config
+function getEffectiveBinCount() {
+    const cfg = GLOBAL_BIN_COUNT;
+    if (typeof cfg === 'object' && cfg) {
+        // ip_bar_diagram uses BAR bin count by design
+        return cfg.BAR || cfg.BARS || 300;
+    }
+    return (typeof cfg === 'number' ? cfg : 300);
 }
 
-// Wrapper to call imported renderCircles with required options and event handlers
-function renderCirclesWithOptions(layer, binned, rScale) {
+// Helper to compute bar width in pixels from binned data and current xScale
+function computeBarWidthPx(binned) {
+    try {
+        if (!Array.isArray(binned) || binned.length === 0 || !xScale) return 4;
+        const centers = Array.from(new Set(binned.filter(d => d.binned && Number.isFinite(d.binCenter)).map(d => Math.floor(d.binCenter)))).sort((a,b)=>a-b);
+        let gap = 0;
+        for (let i = 1; i < centers.length; i++) {
+            const d = centers[i] - centers[i-1];
+            if (d > 0) { gap = (gap === 0) ? d : Math.min(gap, d); }
+        }
+        if (gap <= 0) {
+            const domain = xScale.domain();
+            const microRange = Math.max(1, domain[1] - domain[0]);
+            gap = Math.floor(microRange / Math.max(1, getEffectiveBinCount()));
+        }
+        const half = Math.max(1, Math.floor(gap / 2));
+        const px = Math.max(2, xScale(centers[0] + half) - xScale(centers[0] - half));
+        return Math.max(2, Math.min(24, px));
+    } catch (_) { return 4; }
+}
+
+// Render stacked bars for binned items into given layer
+function renderBars(layer, binned) {
+    if (!layer) return;
+    try { layer.selectAll('.direction-dot').remove(); } catch {}
+
+    // Build stacks per (timeBin, yPos)
+    const stacks = new Map();
+    const items = (binned || []).filter(d => d && d.binned);
+    const globalFlagTotals = new Map();
+    for (const d of items) {
+        const ft = d.flagType || classifyFlags(d.flags);
+        const c = Math.max(1, d.count || 1);
+        globalFlagTotals.set(ft, (globalFlagTotals.get(ft) || 0) + c);
+    }
+    for (const d of items) {
+        const t = Number.isFinite(d.binCenter) ? Math.floor(d.binCenter) : (Number.isFinite(d.binTimestamp) ? Math.floor(d.binTimestamp) : Math.floor(d.timestamp));
+        const key = `${t}|${d.yPos}`;
+        let s = stacks.get(key);
+        if (!s) { s = { center: t, yPos: d.yPos, byFlag: new Map(), total: 0 }; stacks.set(key, s); }
+        const ft = d.flagType || classifyFlags(d.flags);
+        const prev = s.byFlag.get(ft) || { count: 0, packets: [] };
+        prev.count += Math.max(1, d.count || 1);
+        if (Array.isArray(d.originalPackets)) prev.packets = prev.packets.concat(d.originalPackets);
+        s.byFlag.set(ft, prev);
+        s.total += Math.max(1, d.count || 1);
+    }
+    const data = Array.from(stacks.values());
+    const barWidth = computeBarWidthPx(items);
+    const MAX_BAR_H = Math.max(6, Math.min(ROW_GAP - 28, 16));
+    const hScale = d3.scaleLinear().domain([0, Math.max(1, globalMaxBinCount)]).range([1, MAX_BAR_H]);
+
+    const toSegments = (s) => {
+        const parts = Array.from(s.byFlag.entries()).map(([flag, info]) => ({ flagType: flag, count: info.count, packets: info.packets }));
+        parts.sort((a, b) => {
+            const ga = globalFlagTotals.get(a.flagType) || 0;
+            const gb = globalFlagTotals.get(b.flagType) || 0;
+            if (gb !== ga) return gb - ga;
+            return b.count - a.count;
+        });
+        let acc = 0;
+        return parts.map(p => {
+            const h = hScale(Math.max(1, p.count));
+            const yTop = s.yPos - acc - h;
+            acc += h;
+            return {
+                x: xScale(Math.floor(s.center)) - barWidth / 2,
+                y: yTop,
+                w: barWidth,
+                h,
+                datum: {
+                    binned: true,
+                    count: p.count,
+                    flagType: p.flagType,
+                    yPos: s.yPos,
+                    binCenter: s.center,
+                    originalPackets: p.packets || []
+                }
+            };
+        });
+    };
+
+    // Stack groups
+    const stackJoin = layer.selectAll('.bin-stack').data(data, d => `${Math.floor(d.center)}_${d.yPos}`);
+    const stackEnter = stackJoin.enter().append('g').attr('class', 'bin-stack');
+    const stackMerge = stackEnter.merge(stackJoin)
+        .attr('data-anchor-x', d => xScale(Math.floor(d.center)))
+        .attr('data-anchor-y', d => d.yPos)
+        .attr('transform', null)
+        .on('mouseenter', function (event, d) {
+            const g = d3.select(this);
+            const ax = +g.attr('data-anchor-x') || xScale(Math.floor(d.center));
+            const ay = +g.attr('data-anchor-y') || d.yPos;
+            const sx = 1.4, sy = 1.8;
+            g.raise().attr('transform', `translate(${ax},${ay}) scale(${sx},${sy}) translate(${-ax},${-ay})`);
+        })
+        .on('mouseleave', function () {
+            d3.select(this).attr('transform', null);
+            d3.select('#tooltip').style('display', 'none');
+        });
+
+    // Segments within each stack
+    stackMerge.each(function (s) {
+        const segs = toSegments(s);
+        const segJoin = d3.select(this).selectAll('.bin-bar-segment')
+            .data(segs, d => `${Math.floor(d.datum.binCenter || d.datum.timestamp || 0)}_${d.datum.yPos}_${d.datum.flagType}`);
+        segJoin.enter().append('rect')
+            .attr('class', 'bin-bar-segment')
+            .attr('x', d => d.x)
+            .attr('y', d => d.y)
+            .attr('width', d => d.w)
+            .attr('height', d => d.h)
+            .style('fill', d => flagColors[d.datum.flagType] || flagColors.OTHER)
+            .style('opacity', 0.8)
+            .style('stroke', 'none')
+            .style('cursor', 'pointer')
+            .on('mousemove', (event, d) => {
+                const datum = d.datum || {};
+                const center = Math.floor(datum.binCenter || datum.timestamp || 0);
+                const start = Math.floor(datum.binTimestamp || (center - Math.abs(center - (datum.binTimestamp || center))));
+                const end = Math.floor(start + (center - start) * 2);
+                const { utcTime: cUTC } = formatTimestamp(center);
+                const { utcTime: sUTC } = formatTimestamp(start);
+                const { utcTime: eUTC } = formatTimestamp(end);
+                const count = datum.count || 0;
+                const ft = datum.flagType || 'OTHER';
+                const bytes = formatBytes((datum.totalBytes || 0));
+                let tooltipHTML = `<b>${ft}</b><br>Count: ${count}<br>Center: ${cUTC}`;
+                if (start && end) tooltipHTML += `<br>Window: ${sUTC} → ${eUTC}`;
+                tooltipHTML += `<br>Bytes: ${bytes}`;
+                d3.select('#tooltip').style('display', 'block').html(tooltipHTML)
+                    .style('left', `${event.pageX + 40}px`).style('top', `${event.pageY - 40}px`);
+            })
+            .on('mouseleave', () => { d3.select('#tooltip').style('display', 'none'); })
+            .merge(segJoin)
+            .attr('x', d => d.x)
+            .attr('y', d => d.y)
+            .attr('width', d => d.w)
+            .attr('height', d => d.h)
+            .style('fill', d => flagColors[d.datum.flagType] || flagColors.OTHER);
+        segJoin.exit().remove();
+    });
+
+    stackJoin.exit().remove();
+}
+
+// Render circles (existing) for binned items into given layer
+function renderCircles(layer, binned, rScale) {
     if (!layer) return;
     // Clear bar segments in this layer
     try { layer.selectAll('.bin-bar-segment').remove(); } catch {}
-    try { layer.selectAll('.bin-stack').remove(); } catch {}
     const tooltip = d3.select('#tooltip');
     layer.selectAll('.direction-dot')
         .data(binned, d => d.binned ? `bin_${d.timestamp}_${d.yPos}_${d.flagType}` : `${d.src_ip}-${d.dst_ip}-${d.timestamp}`)
@@ -216,7 +317,7 @@ function renderCirclesWithOptions(layer, binned, rScale) {
                     const baseR = +dot.attr('data-orig-r') || +dot.attr('r') || RADIUS_MIN;
                     dot.attr('r', baseR);
                     const packet = d.originalPackets ? d.originalPackets[0] : d;
-                    const arcPath = arcPathGenerator(packet, { xScale, ipPositions, pairs, findIPPosition, flagCurvature: FLAG_CURVATURE });
+                    const arcPath = arcPathGenerator(packet);
                     if (arcPath) {
                         mainGroup.append('path').attr('class', 'hover-arc').attr('d', arcPath)
                             .style('stroke', flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
@@ -243,10 +344,9 @@ function renderCirclesWithOptions(layer, binned, rScale) {
         );
 }
 
-// Unified render function - uses local wrappers that call imported modules
-function renderMarksForLayerLocal(layer, data, rScale) {
-    if (renderMode === 'bars') return renderBarsWithOptions(layer, data);
-    return renderCirclesWithOptions(layer, data, rScale);
+function renderMarksForLayer(layer, data, rScale) {
+    if (renderMode === 'bars') return renderBars(layer, data);
+    return renderCircles(layer, data, rScale);
 }
 
 // Draw a circle-size legend (bottom-right) for smallest/middle/largest counts
@@ -355,8 +455,40 @@ function drawFlagLegend() {
     });
 }
 
+// Global line path generator function updated to draw curved arcs
+function arcPathGenerator(d) {
+    if (!xScale || !ipPositions) return "";
+    const timestampInt = Math.floor(d.timestamp);
+    const x = xScale(timestampInt);
+    const y1 = findIPPosition(d.src_ip, d.src_ip, d.dst_ip, pairs, ipPositions);
+    const y2 = findIPPosition(d.dst_ip, d.src_ip, d.dst_ip, pairs, ipPositions);
+    if (y1 === 0 || y2 === 0 || y1 === y2) return "";
+
+    // Curvature by TCP flag type (pixels of horizontal offset)
+    const flagType = classifyFlags(d.flags);
+    const base = (flagCurvature[flagType] !== undefined) ? flagCurvature[flagType] : flagCurvature.OTHER;
+    const vert = Math.abs(y2 - y1);
+    // Scale curvature slightly with vertical distance so long arcs remain visible
+    const scale = Math.min(1, vert / 200);
+    const dx = base * (0.5 + 0.5 * scale);
+    // If no curvature for this flag, draw straight line
+    if (dx <= 0) {
+        return `M${x},${y1} L${x},${y2}`;
+    }
+    // Curve everything to the right regardless of direction
+    const cx1 = x + dx;
+    const cy1 = y1;
+    const cx2 = x + dx;
+    const cy2 = y2;
+    return `M${x},${y1} C${cx1},${cy1} ${cx2},${cy2} ${x},${y2}`;
+}
 // TCP flag colors, now loaded from flag_colors.json with defaults
-let flagColors = { ...DEFAULT_FLAG_COLORS };
+const defaultFlagColors = {
+    'SYN': '#e74c3c', 'SYN+ACK': '#f39c12', 'ACK': '#27ae60',
+    'FIN': '#8e44ad', 'FIN+ACK': '#9b59b6', 'RST': '#34495e',
+    'PSH+ACK': '#3498db', 'ACK+RST': '#c0392b', 'OTHER': '#bdc3c7'
+};
+let flagColors = { ...defaultFlagColors };
 // Flow-related colors (closing types and invalid reasons) loaded from flow_colors.json
 let flowColors = {
     closing: {
@@ -370,6 +502,23 @@ let flowColors = {
     invalid: {
         // Optional overrides; default invalid reason colors derive from flagColors
     }
+};
+
+// Horizontal curvature levels (in pixels) by TCP flag type
+const flagCurvature = {
+    // Establishment: increasing curvature across steps
+    'SYN': 12,
+    'SYN+ACK': 18,
+    'ACK': 24, // treat pure ACK as final handshake step curvature
+    // Data transfer: moderate curvature
+    'PSH+ACK': 14,
+    // Closing: higher curvature
+    'FIN': 18,
+    'FIN+ACK': 20,
+    'ACK+RST': 28,
+    'RST': 30,
+    // OTHER and unknown types: straight lines
+    'OTHER': 0
 };
 
 // Load color mapping for ground truth events
@@ -428,6 +577,47 @@ fetch('flow_colors.json')
         console.warn('Could not load flow_colors.json:', err);
         // keep defaults in flowColors
     });
+
+function classifyFlags(flags) {
+    if (flags === undefined || flags === null) return 'OTHER';
+    const flagMap = { 0x01: 'FIN', 0x02: 'SYN', 0x04: 'RST', 0x08: 'PSH', 0x10: 'ACK' };
+    const setFlags = Object.entries(flagMap)
+        .filter(([val, _]) => (flags & val) > 0).map(([_, name]) => name).sort();
+    if (setFlags.length === 0) return 'OTHER';
+    const flagStr = setFlags.join('+');
+    if (flagStr === 'ACK+SYN') return 'SYN+ACK';
+    if (flagStr === 'ACK+FIN') return 'FIN+ACK';
+    if (flagStr === 'ACK+PSH') return 'PSH+ACK';
+    return flagStr;
+}
+
+// Map flag type to a high-level TCP phase
+function flagPhase(flagType) {
+    switch (flagType) {
+        case 'SYN':
+        case 'SYN+ACK':
+        case 'ACK':
+            return 'establishment';
+        case 'PSH+ACK':
+        case 'OTHER':
+            return 'data';
+        case 'FIN':
+        case 'FIN+ACK':
+        case 'RST':
+        case 'ACK+RST':
+            return 'closing';
+        default:
+            return 'data';
+    }
+}
+
+function isFlagVisibleByPhase(flagType) {
+    const phase = flagPhase(flagType);
+    if (phase === 'establishment') return !!showEstablishment;
+    if (phase === 'data') return !!showDataTransfer;
+    if (phase === 'closing') return !!showClosing;
+    return true;
+}
 
 // Initialization function for the bar diagram module
 function initializeBarVisualization() {
@@ -547,189 +737,269 @@ function initializeBarVisualization() {
 }
 
 // Window resize handler for responsive visualization
-// Uses module for event handling, with custom onResize callback for app-specific logic
 function setupWindowResizeHandler() {
-    const handleResizeLogic = () => {
-        try {
-            // Only proceed if we have data and existing visualization
-            if (!fullData || fullData.length === 0 || !svg || !xScale || !yScale) {
-                return;
-            }
-            
-            LOG('Handling window resize, updating visualization dimensions');
-            
-            // Store old dimensions for comparison
-            const oldWidth = width;
-            const oldHeight = height;
-            
-            const container = d3.select("#chart-container").node();
-            if (!container) return;
-            
-            // Calculate new dimensions
-            const containerRect = container.getBoundingClientRect();
-            const newWidth = Math.max(400, containerRect.width - chartMarginLeft - chartMarginRight);
-            const newHeight = Math.max(300, containerRect.height - 100); // Leave space for controls
-            
-            // Update global dimensions
-            width = newWidth;
-            height = newHeight;
-            
-            LOG(`Resize: ${oldWidth}x${oldHeight} -> ${width}x${height}`);
-            
-            // Resize main SVG
-            svg.attr('width', width + chartMarginLeft + chartMarginRight)
-               .attr('height', height + 100); // Extra space for bottom margin
-            
-            // Update scales with new width
-            if (xScale && timeExtent) {
-                xScale.range([0, width]);
-            }
-            
-            // Update bottom overlay dimensions
-            bottomOverlayWidth = Math.max(0, newWidth + chartMarginLeft + chartMarginRight);
-            d3.select('#chart-bottom-overlay-svg')
-                .attr('width', bottomOverlayWidth)
-                .attr('height', bottomOverlayHeight);
-            
-            if (bottomOverlayRoot) {
-                bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
-            }
-            
-            // Update main chart axis and legends
-            if (bottomOverlayAxisGroup && xScale) {
-                const axis = d3.axisBottom(xScale).tickFormat(d => {
-                    const timestampInt = Math.floor(d);
-                    const date = new Date(timestampInt / 1000);
-                    return date.toISOString().split('T')[1].split('.')[0];
-                });
-                bottomOverlayAxisGroup.call(axis);
-                
-                // Redraw legends with new dimensions
-                const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
-                if (bottomOverlayDurationLabel) {
-                    bottomOverlayDurationLabel.attr('y', axisBaseY - 12);
+    let resizeTimeout;
+    
+    const handleResize = () => {
+        // Clear existing timeout to debounce rapid resize events
+        clearTimeout(resizeTimeout);
+        
+        resizeTimeout = setTimeout(() => {
+            try {
+                // Only proceed if we have data and existing visualization
+                if (!fullData || fullData.length === 0 || !svg || !xScale || !yScale) {
+                    return;
                 }
                 
-                try { 
-                    drawSizeLegend(bottomOverlayRoot, newWidth, bottomOverlayHeight, axisBaseY); 
-                } catch (e) { 
-                    LOG('Error redrawing size legend:', e); 
+                LOG('Handling window resize, updating visualization dimensions');
+                
+                // Store old dimensions for comparison
+                const oldWidth = width;
+                const oldHeight = height;
+                
+                const container = d3.select("#chart-container").node();
+                if (!container) return;
+                
+                // Calculate new dimensions
+                const containerRect = container.getBoundingClientRect();
+                const newWidth = Math.max(400, containerRect.width - chartMarginLeft - chartMarginRight);
+                const newHeight = Math.max(300, containerRect.height - 100); // Leave space for controls
+                
+                // Update global dimensions
+                width = newWidth;
+                height = newHeight;
+                
+                LOG(`Resize: ${oldWidth}x${oldHeight} -> ${width}x${height}`);
+                
+                // Resize main SVG
+                svg.attr('width', width + chartMarginLeft + chartMarginRight)
+                   .attr('height', height + 100); // Extra space for bottom margin
+                
+                // Update scales with new width
+                if (xScale && timeExtent) {
+                    xScale.range([0, width]);
                 }
                 
-                try { 
-                    drawFlagLegend(); 
-                } catch (e) { 
-                    LOG('Error redrawing flag legend:', e); 
+                // Update bottom overlay dimensions
+                bottomOverlayWidth = Math.max(0, newWidth + chartMarginLeft + chartMarginRight);
+                d3.select('#chart-bottom-overlay-svg')
+                    .attr('width', bottomOverlayWidth)
+                    .attr('height', bottomOverlayHeight);
+                
+                if (bottomOverlayRoot) {
+                    bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
                 }
-            }
-            
-            // Update zoom behavior with new dimensions
-            if (zoom && zoomTarget) {
-                const currentTransform = d3.zoomTransform(zoomTarget.node());
-                zoom.extent([[0, 0], [width, height]])
-                    .scaleExtent([1, Math.max(20, width / 50)]);
                 
-                // Clear the cache to force fresh calculations
-                fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false };
+                // Update main chart axis and legends
+                if (bottomOverlayAxisGroup && xScale) {
+                    const axis = d3.axisBottom(xScale).tickFormat(d => {
+                        const timestampInt = Math.floor(d);
+                        const date = new Date(timestampInt / 1000);
+                        return date.toISOString().split('T')[1].split('.')[0];
+                    });
+                    bottomOverlayAxisGroup.call(axis);
+                    
+                    // Redraw legends with new dimensions
+                    const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
+                    if (bottomOverlayDurationLabel) {
+                        bottomOverlayDurationLabel.attr('y', axisBaseY - 12);
+                    }
+                    
+                    try { 
+                        drawSizeLegend(bottomOverlayRoot, newWidth, bottomOverlayHeight, axisBaseY); 
+                    } catch (e) { 
+                        LOG('Error redrawing size legend:', e); 
+                    }
+                    
+                    try { 
+                        drawFlagLegend(); 
+                    } catch (e) { 
+                        LOG('Error redrawing flag legend:', e); 
+                    }
+                }
                 
-                // Also increment data version to invalidate other caches
-                dataVersion++;
-                
-                // Clear cached selections to force fresh rendering
-                dotsSelection = null;
-                
-                // Trigger the zoom event handler to redraw everything with new scale
-                // We need to dispatch a zoom event to trigger the redraw
-                const event = new CustomEvent('zoom');
-                event.transform = currentTransform;
-                event.sourceEvent = { type: 'resize' };
-                
-                // Get the zoom handler function and call it
-                const zoomHandler = zoom.on('zoom');
-                if (typeof zoomHandler === 'function') {
-                    try {
-                        LOG('Calling zoom handler to redraw with new dimensions');
-                        zoomHandler.call(zoomTarget.node(), event);
-                        LOG('Zoom handler called successfully');
-                    } catch (e) {
-                        LOG('Error calling zoom handler directly:', e);
+                // Update zoom behavior with new dimensions
+                if (zoom && zoomTarget) {
+                    const currentTransform = d3.zoomTransform(zoomTarget.node());
+                    zoom.extent([[0, 0], [width, height]])
+                        .scaleExtent([1, Math.max(20, width / 50)]);
+                    
+                    // Clear the cache to force fresh calculations
+                    fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false };
+                    
+                    // Also increment data version to invalidate other caches
+                    dataVersion++;
+                    
+                    // Clear cached selections to force fresh rendering
+                    dotsSelection = null;
+                    
+                    // Trigger the zoom event handler to redraw everything with new scale
+                    // We need to dispatch a zoom event to trigger the redraw
+                    const event = new CustomEvent('zoom');
+                    event.transform = currentTransform;
+                    event.sourceEvent = { type: 'resize' };
+                    
+                    // Get the zoom handler function and call it
+                    const zoomHandler = zoom.on('zoom');
+                    if (typeof zoomHandler === 'function') {
+                        try {
+                            LOG('Calling zoom handler to redraw with new dimensions');
+                            zoomHandler.call(zoomTarget.node(), event);
+                            LOG('Zoom handler called successfully');
+                        } catch (e) {
+                            LOG('Error calling zoom handler directly:', e);
+                            // Fallback: manually trigger zoom transform
+                            zoomTarget.call(zoom.transform, currentTransform);
+                        }
+                    } else {
+                        LOG('Zoom handler not found, using fallback');
                         // Fallback: manually trigger zoom transform
                         zoomTarget.call(zoom.transform, currentTransform);
                     }
-                } else {
-                    LOG('Zoom handler not found, using fallback');
-                    // Fallback: manually trigger zoom transform
-                    zoomTarget.call(zoom.transform, currentTransform);
                 }
-            }
-            
-            // Recreate overview chart with new dimensions
-            if (timeExtent && timeExtent.length === 2) {
-                try {
-                    createOverviewChart(fullData, {
-                        timeExtent: timeExtent,
-                        width: width,
-                        margins: { left: chartMarginLeft, right: chartMarginRight, top: 80, bottom: 50 }
-                    });
-                    
-                    // Restore brush selection to current zoom domain if available
-                    if (xScale && updateBrushFromZoom) {
-                        updateBrushFromZoom();
+                
+                // Recreate overview chart with new dimensions
+                if (timeExtent && timeExtent.length === 2) {
+                    try {
+                        createOverviewChart(fullData, {
+                            timeExtent: timeExtent,
+                            width: width,
+                            margins: { left: chartMarginLeft, right: chartMarginRight, top: 80, bottom: 50 }
+                        });
+                        
+                        // Restore brush selection to current zoom domain if available
+                        if (xScale && updateBrushFromZoom) {
+                            updateBrushFromZoom();
+                        }
+                    } catch (e) {
+                        LOG('Error recreating overview chart on resize:', e);
                     }
-                } catch (e) {
-                    LOG('Error recreating overview chart on resize:', e);
                 }
+                
+                // The zoom handler will take care of redrawing dots and arcs
+                // Just need to update any additional elements that aren't handled by zoom
+                
+                // Update clip path with new dimensions
+                if (svg) {
+                    svg.select('#clip rect')
+                        .attr('width', width + 40) // DOT_RADIUS equivalent
+                        .attr('height', height + 80); // 2 * DOT_RADIUS equivalent
+                }
+                
+                // Update global domain for overview sync
+                try { 
+                    window.__arc_x_domain__ = xScale.domain(); 
+                } catch {}
+                
+                LOG('Window resize handling complete - zoom handler will redraw visualization');
+                
+                LOG('Window resize handling complete');
+                
+            } catch (e) {
+                console.warn('Error during window resize:', e);
             }
-            
-            // The zoom handler will take care of redrawing dots and arcs
-            // Just need to update any additional elements that aren't handled by zoom
-            
-            // Update clip path with new dimensions
-            if (svg) {
-                svg.select('#clip rect')
-                    .attr('width', width + 40) // DOT_RADIUS equivalent
-                    .attr('height', height + 80); // 2 * DOT_RADIUS equivalent
-            }
-            
-            // Update global domain for overview sync
-            try { 
-                window.__arc_x_domain__ = xScale.domain(); 
-            } catch {}
-            
-            LOG('Window resize handling complete');
-            
-        } catch (e) {
-            console.warn('Error during window resize:', e);
-        }
+        }, 150); // 150ms debounce delay
     };
     
-    // Use module's resize handler with our custom logic
-    return setupWindowResizeHandlerFromModule({
-        debounceMs: 150,
-        onResize: handleResizeLogic
+    // Add resize event listener
+    window.addEventListener('resize', handleResize);
+    
+    // Also handle zoom events from browser (Ctrl+/Ctrl-)
+    window.addEventListener('wheel', (event) => {
+        if (event.ctrlKey || event.metaKey) {
+            // Browser zoom detected, trigger resize after a short delay
+            setTimeout(handleResize, 100);
+        }
+    }, { passive: true });
+    
+    // Handle browser zoom via keyboard shortcuts
+    document.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && (event.key === '+' || event.key === '-' || event.key === '0')) {
+            // Browser zoom shortcut detected
+            setTimeout(handleResize, 100);
+        }
     });
 }
 
+// Function to convert UTC datetime string to epoch microseconds
+function utcToEpochMicroseconds(utcString) {
+    // Parse UTC datetime string like "2009-11-03 13:36:00"
+    const date = new Date(utcString + ' UTC');
+    return date.getTime() * 1000; // Convert to microseconds
+}
 
+// Function to convert epoch microseconds to UTC datetime string
+function epochMicrosecondsToUTC(epochMicroseconds) {
+    const date = new Date(epochMicroseconds / 1000);
+    return date.toISOString().replace('T', ' ').replace('Z', ' UTC');
+}
+
+// Function to load ground truth data
+function loadGroundTruthData() {
+    fetch('GroundTruth_UTC_naive.csv')
+        .then(response => response.text())
+        .then(csvText => {
+            const lines = csvText.split('\n');
+            const headers = lines[0].split(',');
+            
+            groundTruthData = [];
+            for (let i = 1; i < lines.length; i++) {
+                if (lines[i].trim()) {
+                    const values = lines[i].split(',');
+                    if (values.length >= 8) {
+                        const event = {
+                            eventType: values[0],
+                            c2sId: values[1],
+                            source: values[2],
+                            sourcePorts: values[3],
+                            destination: values[4],
+                            destinationPorts: values[5],
+                            startTime: values[6],
+                            stopTime: values[7],
+                            startTimeMicroseconds: utcToEpochMicroseconds(values[6]),
+                            stopTimeMicroseconds: utcToEpochMicroseconds(values[7])
+                        };
+                        groundTruthData.push(event);
+                    }
+                }
+            }
+            LOG(`Loaded ${groundTruthData.length} ground truth events`);
+            
+            // Update ground truth stats display
+            const container = document.getElementById('groundTruthStats');
+            container.innerHTML = `Loaded ${groundTruthData.length} ground truth events<br>Select 2+ IPs to view matching events`;
+            container.style.color = '#27ae60';
+        })
+        .catch(error => {
+            console.warn('Could not load GroundTruth_UTC_naive.csv:', error);
+            groundTruthData = [];
+        });
+}
 
 // Global update functions that preserve zoom state
 let flowUpdateTimeout = null;
 
 // Centralized helper to apply a new time domain to the main chart (keeps brush/wheel/flow zoom in sync)
-// Wrapper that calls the module function with current global state
 function applyZoomDomain(newDomain, source = 'program') {
+    if (!zoom || !zoomTarget || !xScale || !timeExtent || timeExtent.length !== 2) return;
+    let [a, b] = newDomain;
+    // Clamp and normalize
+    const min = timeExtent[0], max = timeExtent[1];
+    a = Math.max(min, Math.min(max, Math.floor(a)));
+    b = Math.max(min, Math.min(max, Math.floor(b)));
+    if (b <= a) { b = Math.min(max, a + 1); }
+
+    const fullRange = max - min;
+    const selectedRange = b - a;
+    const k = fullRange / selectedRange;
+    const originalScale = d3.scaleLinear().domain(timeExtent).range([0, width]);
+    // Correct transform math: x = -k * S0(a)
+    const tx = -k * originalScale(a);
+
     // If the source is the brush, notify overview to avoid circular updates
     if (source === 'brush') { try { setBrushUpdating(true); } catch(_) {} }
-    
-    applyZoomDomainFromModule(newDomain, {
-        zoom,
-        zoomTarget,
-        xScale,
-        timeExtent,
-        width,
-        d3
-    }, source);
-    
+    // Apply transform on the same element that has the zoom behavior
+    zoomTarget.call(zoom.transform, d3.zoomIdentity.translate(tx, 0).scale(k));
     if (source === 'brush') {
         // Release the flag after the event loop so zoomed() can run with the guard
         setTimeout(() => { try { setBrushUpdating(false); } catch(_) {} }, 0);
@@ -749,9 +1019,21 @@ function updateTcpFlowLinesGlobalDebounced() {
     }, 100); // 100ms debounce
 }
 
-// Wrapper function that uses the module function with global state
 function buildSelectedFlowKeySet() {
-    return buildSelectedFlowKeySetFromModule(tcpFlows, selectedFlowIds);
+    // Build a Set of normalized connection keys for currently selected flows (O(number of selected flows))
+    const keys = new Set();
+    if (!tcpFlows || tcpFlows.length === 0 || selectedFlowIds.size === 0) return keys;
+    tcpFlows.forEach(flow => {
+        if (selectedFlowIds.has(String(flow.id))) {
+            const key = flow.key || makeConnectionKey(flow.initiator, flow.initiatorPort, flow.responder, flow.responderPort);
+            if (key) {
+                keys.add(key);
+                LOG(`Selected flow key: ${key} for flow ${flow.id}`);
+            }
+        }
+    });
+    LOG(`Built ${keys.size} selected flow keys:`, Array.from(keys));
+    return keys;
 }
 
 function updateTcpFlowPacketsGlobal() {
@@ -864,12 +1146,12 @@ function applyInvalidReasonFilter() {
                     for (let i = 0; i < len; i++) {
                         const p = arr[i];
                         const ftype = classifyFlags(p.flags);
-                        if (isFlagVisibleByPhase(ftype, { showEstablishment, showDataTransfer, showClosing })) { anyVisibleByPhase = true; break; }
+                        if (isFlagVisibleByPhase(ftype)) { anyVisibleByPhase = true; break; }
                     }
                     hide = !anyVisibleByPhase;
                 } else if (d) {
                     const ftype = d.binned ? d.flagType : classifyFlags(d.flags);
-                    hide = !isFlagVisibleByPhase(ftype, { showEstablishment, showDataTransfer, showClosing });
+                    hide = !isFlagVisibleByPhase(ftype);
                 }
             }
             d3.select(this)
@@ -895,7 +1177,7 @@ function applyInvalidReasonFilter() {
             }
             if (!hide) {
                 const ftype = d && d.flagType ? d.flagType : 'OTHER';
-                hide = !isFlagVisibleByPhase(ftype, { showEstablishment, showDataTransfer, showClosing });
+                hide = !isFlagVisibleByPhase(ftype);
             }
             d3.select(this).style('display', hide ? 'none' : null).style('opacity', hide ? 0 : null);
         });
@@ -991,25 +1273,12 @@ function redrawSelectedFlowsView() {
     }
 
     // Bin using current settings (may resolve to per-packet if sparse)
-    const binnedPackets = binPackets(visiblePackets, {
-        xScale,
-        timeExtent,
-        findIPPosition,
-        ipPositions,
-        pairs,
-        binCount: getEffectiveBinCount(GLOBAL_BIN_COUNT, renderMode),
-        useBinning,
-        width
-    });
+    const binnedPackets = binPackets(visiblePackets, xScale, yScale, timeExtent);
     const rScale = d3.scaleSqrt().domain([1, Math.max(1, globalMaxBinCount)]).range([RADIUS_MIN, RADIUS_MAX]);
-    renderMarksForLayerLocal(dynamicLayer, binnedPackets, rScale);
+    renderMarksForLayer(dynamicLayer, binnedPackets, rScale);
 
     // After redraw, recompute sizes based on what is actually visible
-    setTimeout(() => { 
-        try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch(_) {} 
-        // Sync worker with updated dynamic layer data
-        try { syncWorkerWithRenderedData(); } catch(_) {}
-    }, 80);
+    setTimeout(() => { try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch(_) {} }, 80);
     // Re-apply legend-based filtering
     try { applyInvalidReasonFilter(); } catch(_) {}
 }
@@ -1017,32 +1286,15 @@ function redrawSelectedFlowsView() {
 // Worker-enabled packet filtering (falls back to legacy if worker unavailable)
 function filterPacketsBySelectedFlows() {
     if (!svg || !mainGroup) return;
-    if (!workerManager) { 
-        legacyFilterPacketsBySelectedFlows(); 
-        return; 
-    }
-    
-    // Check if we have a reasonable number of dots to match our data
-    const dots = mainGroup.selectAll('.direction-dot').nodes();
-    const currentMask = workerManager.getVisibilityMask();
-    
-    if (currentMask && dots.length !== currentMask.length) {
-        // DOM has been updated, worker mask is stale - try to resync
-        if (DEBUG) console.warn(`Worker mask stale (mask=${currentMask.length}, dots=${dots.length}), attempting resync`);
-        syncWorkerWithRenderedData();
-        
-        // After resync, if still mismatched, fall back to legacy
-        const newMask = workerManager.getVisibilityMask();
-        if (newMask && dots.length !== newMask.length) {
-            if (DEBUG) console.warn('Resync failed, using legacy filtering');
-            legacyFilterPacketsBySelectedFlows();
-            return;
-        }
-    }
-    
+    if (!packetWorker) { legacyFilterPacketsBySelectedFlows(); return; }
     const showAll = !showTcpFlows || selectedFlowIds.size === 0;
     const selectedKeys = showAll ? [] : Array.from(buildSelectedFlowKeySet());
-    workerManager.filterByKeys(selectedKeys, showAll);
+    const msg = { type: 'filterByKeys', keys: selectedKeys, showAllWhenEmpty: showAll };
+    if (!packetWorkerReady) {
+        pendingFilterRequest = msg;
+    } else {
+        try { packetWorker.postMessage(msg); } catch (e) { console.error('postMessage failed', e); legacyFilterPacketsBySelectedFlows(); }
+    }
 }
 
 // Legacy in-main-thread filtering retained for fallback/debug
@@ -1143,10 +1395,9 @@ function drawSelectedFlowArcs() {
     const zoomLevel = calculateZoomLevel(xScale, timeExtent);
     const currentDomain = xScale.domain();
     const relevantTimeRange = Math.max(1, currentDomain[1] - currentDomain[0]);
-    const effectiveBinCount = getEffectiveBinCount(GLOBAL_BIN_COUNT, renderMode);
-    const binSizeCandidate = getBinSize(zoomLevel, relevantTimeRange, effectiveBinCount, useBinning);
+    const binSizeCandidate = getBinSize(zoomLevel, relevantTimeRange);
     const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
-    const estBins = Math.max(1, Math.min(effectiveBinCount, Math.floor(typeof width === 'number' ? width : effectiveBinCount)));
+    const estBins = Math.max(1, Math.min(getEffectiveBinCount(), Math.floor(typeof width === 'number' ? width : getEffectiveBinCount())));
     const expectedPktsPerBin = visiblePackets.length / estBins;
     const doBinning = (binSizeCandidate !== 0) && (binSizeCandidate > microsPerPixel) && (expectedPktsPerBin >= 1.15);
 
@@ -1197,10 +1448,10 @@ function drawSelectedFlowArcs() {
 
     groups.forEach(g => {
         const ftype = g.flagType;
-        if (!isFlagVisibleByPhase(ftype, { showEstablishment, showDataTransfer, showClosing })) return;
+        if (!isFlagVisibleByPhase(ftype)) return;
 
         const pathPacket = g.rep;
-        const path = arcPathGenerator(pathPacket, { xScale, ipPositions, pairs, findIPPosition, flagCurvature: FLAG_CURVATURE });
+        const path = arcPathGenerator(pathPacket);
         if (path && pathPacket.src_ip !== pathPacket.dst_ip) {
             // Lookup bin count using the group's time bucket (g.timestamp) and the source row y position
             const yPos = findIPPosition(pathPacket.src_ip, pathPacket.src_ip, pathPacket.dst_ip, pairs, ipPositions);
@@ -1234,9 +1485,53 @@ function updateClosingLinesGlobal() { /* Closing lines group present but disable
         
 // Sidebar event wiring moved to sidebar.js (sbWireSidebarControls)
 
+// Function to filter ground truth events by IP pairs
+function filterGroundTruthByIPs(selectedIPs) {
+    if (!groundTruthData || groundTruthData.length === 0 || selectedIPs.length < 2) {
+        return [];
+    }
 
+    return groundTruthData.filter(event => {
+        const sourceIP = event.source;
+        const destIP = event.destination;
+        
+        // Check if both source and destination are in the selected IPs
+        return selectedIPs.includes(sourceIP) && selectedIPs.includes(destIP);
+    });
+}
 
+// Function to update ground truth statistics
+function updateGroundTruthStats(selectedIPs) {
+    if (!groundTruthData || groundTruthData.length === 0) {
+        sbUpdateGroundTruthStatsUI('Ground truth data not loaded', false);
+        return;
+    }
 
+    if (selectedIPs.length < 2) {
+        sbUpdateGroundTruthStatsUI(`Loaded ${groundTruthData.length} total events<br>Select 2+ IPs to view matching events`, true);
+        return;
+    }
+
+    const matchingEvents = filterGroundTruthByIPs(selectedIPs);
+    
+    if (matchingEvents.length === 0) {
+        sbUpdateGroundTruthStatsUI(`No ground truth events found for selected IPs<br>Total events: ${groundTruthData.length}`, false);
+    } else {
+        // Group events by type
+        const eventTypeCounts = {};
+        matchingEvents.forEach(event => {
+            eventTypeCounts[event.eventType] = (eventTypeCounts[event.eventType] || 0) + 1;
+        });
+
+        let statsHTML = `<strong>${matchingEvents.length} matching events found</strong><br>`;
+        Object.entries(eventTypeCounts).forEach(([type, count]) => {
+            const color = eventColors[type] || '#666';
+            statsHTML += `<span style="color: ${color}; font-weight: bold;">${type}: ${count}</span><br>`;
+        });
+        
+        sbUpdateGroundTruthStatsUI(statsHTML, true);
+    }
+}
 
 // Function to draw ground truth event boxes
 function drawGroundTruthBoxes(selectedIPs) {
@@ -1247,7 +1542,7 @@ function drawGroundTruthBoxes(selectedIPs) {
         return;
     }
 
-    const matchingEvents = filterGroundTruthByIPs(groundTruthData, selectedIPs);
+    const matchingEvents = filterGroundTruthByIPs(selectedIPs);
     if (matchingEvents.length === 0) {
         mainGroup.selectAll('.ground-truth-box').remove();
         mainGroup.selectAll('.ground-truth-label').remove();
@@ -1260,13 +1555,58 @@ function drawGroundTruthBoxes(selectedIPs) {
         groundTruthGroup = mainGroup.append('g').attr('class', 'ground-truth-group');
     }
 
-    // Prepare data for boxes using new module function
-    const boxData = prepareGroundTruthBoxData(matchingEvents, {
-        xScale,
-        findIPPosition,
-        pairs,
-        ipPositions,
-        eventColors
+    // Prepare data for boxes - create separate boxes for each IP
+    const boxData = [];
+    matchingEvents.forEach(event => {
+        const sourceY = findIPPosition(event.source, event.source, event.destination, pairs, ipPositions);
+        const destY = findIPPosition(event.destination, event.source, event.destination, pairs, ipPositions);
+        
+        if (sourceY === 0 || destY === 0) return; // Skip if IPs not in current pairs
+        
+        // Apply estimated time expansion to all events (not just when start = stop time)
+        // Add 59 seconds to stop time regardless of case
+        let adjustedStartMicroseconds = event.startTimeMicroseconds;
+        let adjustedStopMicroseconds = event.stopTimeMicroseconds;
+        let wasExpanded = false;
+        
+        // Add 59 seconds to stop time for all events
+        adjustedStopMicroseconds = event.stopTimeMicroseconds + 59 * 1_000_000;
+        wasExpanded = true;
+        
+        const startX = xScale(adjustedStartMicroseconds);
+        const endX = xScale(adjustedStopMicroseconds);
+        const width = Math.max(1, endX - startX); // Ensure minimum width
+        const boxHeight = 20; // Fixed height for individual IP boxes
+        
+        // Create box for source IP
+        boxData.push({
+            event: event,
+            ip: event.source,
+            x: startX,
+            y: sourceY - boxHeight / 2, // Center the box on the IP line
+            width: width,
+            height: boxHeight,
+            color: eventColors[event.eventType] || '#666',
+            isSource: true,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
+        });
+        
+        // Create box for destination IP
+        boxData.push({
+            event: event,
+            ip: event.destination,
+            x: startX,
+            y: destY - boxHeight / 2, // Center the box on the IP line
+            width: width,
+            height: boxHeight,
+            color: eventColors[event.eventType] || '#666',
+            isSource: false,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
+        });
     });
 
     // Update boxes
@@ -1434,9 +1774,7 @@ async function updateIPFilter() {
         updateTcpFlowStats(currentFlows);
         
         // Update ground truth statistics
-        // Update ground truth stats using new module
-        const stats = calculateGroundTruthStats(groundTruthData, selectedIPs, eventColors);
-        sbUpdateGroundTruthStatsUI(stats.html, stats.hasMatches);
+        updateGroundTruthStats(selectedIPs);
 
         // Compute force layout positions for IPs before visualization
         computeForceLayoutPositions(filteredData, selectedIPs, () => {
@@ -1511,18 +1849,116 @@ const updateFlagStats = (packets) => sbUpdateFlagStats(packets, classifyFlags, f
 
 const updateIPStats = (packets) => sbUpdateIPStats(packets, flagColors, formatBytes);
 
+function formatBytes(bytes) {
+    // Handle invalid or non-numeric values
+    if (bytes === null || bytes === undefined || isNaN(bytes) || bytes < 0) return '0 B';
+    if (bytes === 0) return '0 B';
+    
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const index = Math.min(i, sizes.length - 1);
+    return parseFloat((bytes / Math.pow(k, index)).toFixed(1)) + ' ' + sizes[index];
+}
+
+
+// Build force layout nodes and links from current packets
+function buildForceLayoutData(packets, selectedIPs) {
+    if (!packets || packets.length === 0 || !selectedIPs || selectedIPs.length === 0) {
+        return { nodes: [], links: [] };
+    }
+
+    // Create nodes for each IP with initial positions
+    const initWidth = (typeof width !== 'undefined' && width > 0) ? width : 800;
+    const initHeight = (typeof height !== 'undefined' && height > 0) ? height : 600;
+    const ipSet = new Set(selectedIPs);
+
+    // Calculate per-IP connectivity from raw packets (before any binning)
+    const ipConnectivity = new Map();
+    selectedIPs.forEach(ip => ipConnectivity.set(ip, new Set()));
+
+    // Count unique IPs each IP communicates with
+    packets.forEach(packet => {
+        if (!packet.src_ip || !packet.dst_ip) return;
+        if (packet.src_ip === packet.dst_ip) return;
+        if (!ipSet.has(packet.src_ip) || !ipSet.has(packet.dst_ip)) return;
+
+        ipConnectivity.get(packet.src_ip).add(packet.dst_ip);
+        ipConnectivity.get(packet.dst_ip).add(packet.src_ip);
+    });
+
+    const nodes = selectedIPs.map((ip, idx) => ({
+        id: ip,
+        ip: ip,
+        index: idx,
+        degree: ipConnectivity.get(ip).size, // Number of unique connections
+        x: initWidth / 2,
+        y: TOP_PAD + idx * ROW_GAP,
+        vx: 0,
+        vy: 0
+    }));
+
+    console.log('[Force Layout] IP connectivity:', nodes.map(n => `${n.ip}: ${n.degree}`));
+
+    // Build links from packet connections
+    const linkMap = new Map();
+
+    packets.forEach(packet => {
+        if (!packet.src_ip || !packet.dst_ip) return;
+        if (packet.src_ip === packet.dst_ip) return; // Skip self-connections
+
+        // Only count packets between selected IPs
+        if (!ipSet.has(packet.src_ip) || !ipSet.has(packet.dst_ip)) return;
+
+        const key = packet.src_ip < packet.dst_ip
+            ? `${packet.src_ip}|${packet.dst_ip}`
+            : `${packet.dst_ip}|${packet.src_ip}`;
+
+        if (!linkMap.has(key)) {
+            linkMap.set(key, { count: 0, bytes: 0 });
+        }
+        const link = linkMap.get(key);
+        link.count++;
+        link.bytes += (packet.length || 0);
+    });
+
+    // Convert link map to array
+    // In D3 v7, links should reference nodes by their ID (IP address), not by index
+    const links = [];
+    linkMap.forEach((data, key) => {
+        const [src, dst] = key.split('|');
+        links.push({
+            source: src,  // Use IP address directly (matches node.id)
+            target: dst,  // Use IP address directly (matches node.id)
+            count: data.count,
+            bytes: data.bytes
+        });
+    });
+
+    console.log(`[Force Layout] Built ${links.length} links from ${packets.length} packets between ${selectedIPs.length} IPs`);
+
+    // Log top links by traffic volume for debugging
+    if (links.length > 0) {
+        const topLinks = links.slice().sort((a, b) => b.count - a.count).slice(0, 5);
+        console.log('[Force Layout] Top 5 links by packet count:', topLinks.map(l => ({
+            from: l.source,
+            to: l.target,
+            packets: l.count,
+            bytes: l.bytes
+        })));
+    }
+
+    return { nodes, links };
+}
+
 // Initialize and run force layout to position IPs
-// Uses extracted module functions with local state management
 function computeForceLayoutPositions(packets, selectedIPs, onComplete) {
     if (isForceLayoutRunning) {
         LOG('Force layout already running, stopping previous layout');
         if (forceLayout) forceLayout.stop();
     }
 
-    const simWidth = (typeof width !== 'undefined' && width > 0) ? width : 800;
-    const simHeight = (typeof height !== 'undefined' && height > 0) ? height : 600;
-
-    const { nodes, links } = buildForceLayoutData(packets, selectedIPs, { width: simWidth, height: simHeight });
+    const { nodes, links } = buildForceLayoutData(packets, selectedIPs);
     
     if (nodes.length === 0) {
         if (onComplete) onComplete();
@@ -1541,51 +1977,139 @@ function computeForceLayoutPositions(packets, selectedIPs, onComplete) {
         console.log(`[Force Layout] Link counts: min=${minCount}, max=${maxCount}`);
     }
 
-    // Use module function but with local callback for state management
-    forceLayout = computeForceLayoutPositionsBase(packets, selectedIPs, {
-        d3,
-        width: simWidth,
-        height: simHeight,
-        onComplete: (result) => {
+    // Create force simulation - match main.js approach
+    // Use 2D force layout, then extract Y positions for vertical ordering
+    const simWidth = (typeof width !== 'undefined' && width > 0) ? width : 800;
+    const simHeight = (typeof height !== 'undefined' && height > 0) ? height : 600;
+
+    forceLayout = d3.forceSimulation(forceNodes)
+        .force('charge', d3.forceManyBody().strength(-120)) // Repulsion between nodes
+        .force('link', d3.forceLink(forceLinks)
+            .id(d => d.id)
+            .distance(80) // Fixed distance like main.js force2
+            .strength(0.5))
+        .force('center', d3.forceCenter(simWidth / 2, simHeight / 2)) // Center the whole graph
+        .alphaDecay(0.02) // Slower cooling
+        .velocityDecay(0.1) // Low friction
+        .alpha(0.3) // Initial energy
+        .on('tick', () => {
+            // Update during simulation (optional - we mainly care about final positions)
+        })
+        .on('end', () => {
             console.log('[Force Layout] Simulation ended');
             isForceLayoutRunning = false;
-            
-            // Apply positions from module result to global state
-            if (result && result.ipOrder && result.ipPositions) {
-                ipOrder = result.ipOrder;
-                result.ipPositions.forEach((pos, ip) => {
-                    ipPositions.set(ip, pos);
-                });
-
-                console.log('[Force Layout] Assigned screen positions:',
-                    ipOrder.map((ip, idx) => ({ ip, y: ipPositions.get(ip) })));
-
-                // Update the visualization to use new positions
-                if (svg && mainGroup) {
-                    try {
-                        // Update node labels to new positions with smooth animation
-                        svg.selectAll('.node')
-                            .transition()
-                            .duration(800)
-                            .attr('transform', d => `translate(0,${ipPositions.get(d)})`);
-                    } catch (e) {
-                        console.error('[Force Layout] Error updating positions:', e);
-                    }
-                }
-            }
-            
+            applyForceLayoutPositions();
             if (onComplete) onComplete();
-        }
-    });
+        });
 
     isForceLayoutRunning = true;
 }
 
-// TCP States (matching tcp_analysis.py) - now imported as TCP_STATES
+// Apply computed force layout positions to IP positions
+function applyForceLayoutPositions() {
+    if (!forceNodes || forceNodes.length === 0) return;
 
-// ---- Tunables - now imported as HANDSHAKE_TIMEOUT_MS, REORDER_WINDOW_PKTS, REORDER_WINDOW_MS
+    console.log('[Force Layout] Applying computed positions');
 
-// ---- Minimal flag helpers - now imported from src/tcp/flags.js
+    // Calculate connectivity (degree) for each node
+    const connectivity = new Map();
+    forceNodes.forEach(n => connectivity.set(n.ip, 0));
+
+    if (forceLayout && forceLayout.force('link')) {
+        const linkForce = forceLayout.force('link');
+        const links = linkForce.links();
+        links.forEach(link => {
+            const src = typeof link.source === 'object' ? link.source.id : link.source;
+            const tgt = typeof link.target === 'object' ? link.target.id : link.target;
+            connectivity.set(src, (connectivity.get(src) || 0) + 1);
+            connectivity.set(tgt, (connectivity.get(tgt) || 0) + 1);
+        });
+    }
+
+    // Sort nodes by their computed Y position
+    const sortedNodes = forceNodes.slice().sort((a, b) => a.y - b.y);
+
+    console.log('[Force Layout] Final IP order:', sortedNodes.map((n, i) => `${i + 1}. ${n.ip} (${connectivity.get(n.ip)} links, y=${Math.round(n.y)})`));
+
+    // Update ipOrder and ipPositions based on sorted Y positions
+    ipOrder = sortedNodes.map(n => n.ip);
+
+    // Assign evenly-spaced Y positions based on sorted order
+    ipOrder.forEach((ip, idx) => {
+        ipPositions.set(ip, TOP_PAD + idx * ROW_GAP);
+    });
+
+    console.log('[Force Layout] Assigned screen positions:',
+        ipOrder.map((ip, idx) => ({ ip, y: TOP_PAD + idx * ROW_GAP })));
+
+    // Update the visualization to use new positions
+    if (svg && mainGroup) {
+        try {
+            // Update node labels to new positions with smooth animation
+            svg.selectAll('.node')
+                .transition()
+                .duration(800)
+                .attr('transform', d => `translate(0,${ipPositions.get(d)})`);
+
+            // Update dots/arcs will happen automatically on next render
+        } catch (e) {
+            console.error('[Force Layout] Error updating positions:', e);
+        }
+    }
+}
+function getColoredFlags(flagStats, type) {
+    const flagsWithCounts = Object.entries(flagStats)
+        .filter(([flag, count]) => count > 0)
+        .sort(([,a], [,b]) => b - a);
+    
+    if (flagsWithCounts.length === 0) {
+        return '<span style="color: #999; font-style: italic;">None</span>';
+    }
+    
+    return flagsWithCounts.map(([flag, count]) => {
+        const color = flagColors[flag] || '#bdc3c7';
+        return `
+            <span style="
+                display: inline-block;
+                background-color: ${color};
+                color: white;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+                text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+                min-width: 20px;
+                text-align: center;
+            " title="${flag}: ${count.toLocaleString()} packets">
+                ${flag}: ${count.toLocaleString()}
+            </span>
+        `;
+    }).join('');
+}
+
+function getTopFlags(flagStats) {
+    const sortedFlags = Object.entries(flagStats)
+        .filter(([flag, count]) => count > 0)
+        .sort(([,a], [,b]) => b - a)
+        .slice(0, 3)
+        .map(([flag, count]) => `${flag}(${count})`)
+        .join(', ');
+    return sortedFlags || 'None';
+}
+
+// TCP States (matching tcp_analysis.py)
+const S_NEW = 0, S_INIT = 1, S_SYN_RCVD = 2, S_EST = 3, S_FIN_1 = 4, S_FIN_2 = 5, S_CLOSED = 6, S_ABORTED = 7;
+
+// ---- Tunables --------------------------------------------------------------
+const HANDSHAKE_TIMEOUT_MS = 3_000;   // How long to wait for the missing step
+const REORDER_WINDOW_PKTS = 6;        // Small buffer to tolerate reordering
+const REORDER_WINDOW_MS   = 500;      // Or: time-based reorder window
+
+// ---- Minimal flag helpers --------------------------------------------------
+const has = (p, f) => p.flags?.[f] === true;
+const isSYN     = p => has(p,'syn') && !has(p,'ack') && !has(p,'rst');
+const isSYNACK  = p => has(p,'syn') && has(p,'ack')  && !has(p,'rst');
+const isACKonly = p => has(p,'ack') && !has(p,'syn') && !has(p,'fin') && !has(p,'rst');
 
 // ---- Per-flow state --------------------------------------------------------
 // HandshakeState type
@@ -1795,7 +2319,7 @@ function detectClosingPatterns(packets) {
                     responder: null,
                     isn_i: null,
                     isn_r: null,
-                    state: TCP_STATES.S_NEW,
+                    state: S_NEW,
                     t_syn: null,
                     t_synack: null,
                     t_ack3: null,
@@ -1831,51 +2355,51 @@ function detectClosingPatterns(packets) {
                     state.responder = [packet.dst_ip, packet.dst_port];
                     state.isn_i = packet.seq_num;
                     state.t_syn = packet.timestamp;
-                    state.state = TCP_STATES.S_INIT;
+                    state.state = S_INIT;
                     state.saw_syn_in_capture = true;
                 }
             }
             
             // SYN+ACK packet
-            else if (syn && ackf && !rst && state.state === TCP_STATES.S_INIT) {
+            else if (syn && ackf && !rst && state.state === S_INIT) {
                 if (packet.ack_num === state.isn_i + 1) {
                     state.isn_r = packet.seq_num;
                     state.t_synack = packet.timestamp;
-                    state.state = TCP_STATES.S_SYN_RCVD;
+                    state.state = S_SYN_RCVD;
                 }
             }
             
             // Final ACK (handshake complete)
-            else if (ackf && !syn && !fin && !rst && state.state === TCP_STATES.S_SYN_RCVD) {
+            else if (ackf && !syn && !fin && !rst && state.state === S_SYN_RCVD) {
                 if (packet.ack_num === state.isn_r + 1) {
                     state.t_ack3 = packet.timestamp;
-                    state.state = TCP_STATES.S_EST;
+                    state.state = S_EST;
                 }
             }
             
             // RST (abortive close)
-            else if (rst && state.state >= TCP_STATES.S_EST) {
+            else if (rst && state.state >= S_EST) {
                 state.t_close = packet.timestamp;
                 state.close_reason = "rst";
-                state.state = TCP_STATES.S_ABORTED;
+                state.state = S_ABORTED;
                 break; // Connection terminated
             }
             
             // FIN-based graceful close (matching tcp_analysis.py state machine)
-            else if (fin && state.state >= TCP_STATES.S_EST) {
-                if (state.state === TCP_STATES.S_EST) {
+            else if (fin && state.state >= S_EST) {
+                if (state.state === S_EST) {
                     // First FIN received
-                    state.state = TCP_STATES.S_FIN_1;
+                    state.state = S_FIN_1;
                     fin1Packet = packet;
-                } else if (state.state === TCP_STATES.S_FIN_1) {
+                } else if (state.state === S_FIN_1) {
                     // Second FIN received (from other side)
-                    state.state = TCP_STATES.S_FIN_2;
+                    state.state = S_FIN_2;
                     fin2Packet = packet;
                 }
             }
             // Final ACK after second FIN (normal TCP close)
-            else if (ackf && !fin && !syn && !rst && state.state === TCP_STATES.S_FIN_2) {
-                state.state = TCP_STATES.S_CLOSED;
+            else if (ackf && !fin && !syn && !rst && state.state === S_FIN_2) {
+                state.state = S_CLOSED;
                 state.t_close = packet.timestamp;
                 state.close_reason = "fin";
                 finalAckPacket = packet;
@@ -1884,7 +2408,7 @@ function detectClosingPatterns(packets) {
         }
         
         // If we have a complete closing sequence, add it to results
-        if (state.state === TCP_STATES.S_CLOSED && state.close_reason === "fin" && fin1Packet && fin2Packet && finalAckPacket) {
+        if (state.state === S_CLOSED && state.close_reason === "fin" && fin1Packet && fin2Packet && finalAckPacket) {
             closings.push({
                 connectionKey: connectionKey,
                 type: 'graceful_close',
@@ -1897,7 +2421,7 @@ function detectClosingPatterns(packets) {
             });
         }
         // Handle half-close (only one FIN received before connection ends)
-        else if (state.state === TCP_STATES.S_FIN_1 && fin1Packet) {
+        else if (state.state === S_FIN_1 && fin1Packet) {
             // Look for ACK to the FIN
             const ackPacket = connectionPackets.find(p => 
                 p.timestamp > fin1Packet.timestamp &&
@@ -1961,11 +2485,6 @@ function updateClosingStats(closings) {
     }
 }
 
-// Wrapper for exportFlowToCSV that provides the fullData and helpers
-function exportFlowToCSV(flow) {
-    return exportFlowToCSVFromModule(flow, fullData, { classifyFlags, formatTimestamp });
-}
-
 const createFlowList = (flows) => sbCreateFlowListCapped(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors);
 
 const updateTcpFlowStats = (flows) => sbUpdateTcpFlowStats(flows, selectedFlowIds, formatBytes);
@@ -1979,12 +2498,249 @@ function filterIPList(searchTerm) {
     });
 }
 
-// createTooltipHTML is now imported from './src/rendering/tooltip.js'
+function formatTimestamp(timestamp) {
+    // Convert to integer to handle floating point precision issues
+    const timestampInt = Math.floor(timestamp);
+    const timestampSec = (timestampInt / 1000000).toFixed(6);
+    const date = new Date(timestampInt / 1000);
+    const utcTime = date.toISOString().replace('T', ' ').replace('Z', ' UTC');
+    return { utcTime, timestampSec };
+}
+
+function createTooltipHTML(data) {
+    const PROTOCOL_MAP = {
+        1: 'ICMP',
+        2: 'IGMP',
+        6: 'TCP',
+        17: 'UDP',
+        41: 'IPv6',
+        47: 'GRE',
+        50: 'ESP',
+        51: 'AH',
+        58: 'ICMPv6',
+        89: 'OSPF',
+        132: 'SCTP'
+    };
+    function normalizeProtocolValue(raw) {
+        if (raw === undefined || raw === null || raw === '') return 'TCP';
+        if (Array.isArray(raw)) raw = raw[0];
+        if (typeof raw === 'string') {
+            const upper = raw.trim().toUpperCase();
+            if (/^\d+$/.test(upper)) {
+                const num = parseInt(upper, 10);
+                return PROTOCOL_MAP[num] ? `${PROTOCOL_MAP[num]} (${num})` : `Unknown (${num})`;
+            }
+            return upper || 'TCP';
+        }
+        if (typeof raw === 'number') {
+            return PROTOCOL_MAP[raw] ? `${PROTOCOL_MAP[raw]} (${raw})` : `Unknown (${raw})`;
+        }
+        return 'TCP';
+    }
+    function extractProtocol(p) {
+        if (!p) return 'TCP';
+        const raw = p.protocol ?? p.ip_proto ?? p.ipProtocol ?? p.proto ?? p.ipProtocolNumber;
+        return normalizeProtocolValue(raw);
+    }
+    if (data.binned && data.count > 1) {
+        // Binned data tooltip
+        const { utcTime, timestampSec } = formatTimestamp(data.timestamp);
+        let tooltipContent = `<b>${data.flagType} (Binned)</b><br>`;
+        tooltipContent += `Count: ${data.count} packets<br>`;
+        tooltipContent += `From: ${data.src_ip}<br>To: ${data.dst_ip}<br>`;
+        if (data.originalPackets && data.originalPackets.length) {
+            const protocols = Array.from(new Set(data.originalPackets.map(extractProtocol)));
+            tooltipContent += `Protocol: ${protocols.join(', ')}<br>`;
+        } else {
+            tooltipContent += `Protocol: ${extractProtocol(data)}<br>`;
+        }
+        tooltipContent += `Time Bin: ${utcTime}<br>`;
+        tooltipContent += `Total Bytes: ${formatBytes(data.totalBytes)}`;
+        
+        // Show range of sequence numbers if available
+        const seqNums = data.originalPackets.map(p => p.seq_num).filter(s => s !== undefined && s !== null);
+        if (seqNums.length > 0) {
+            const minSeq = Math.min(...seqNums);
+            const maxSeq = Math.max(...seqNums);
+            tooltipContent += `<br>Seq Range: ${minSeq} - ${maxSeq}`;
+        }
+        
+        return tooltipContent;
+    } else {
+        // Single packet tooltip
+        const packet = data.originalPackets ? data.originalPackets[0] : data;
+        const { utcTime, timestampSec } = formatTimestamp(packet.timestamp);
+        let tooltipContent = `<b>${classifyFlags(packet.flags)}</b><br>From: ${packet.src_ip}<br>To: ${packet.dst_ip}<br>Protocol: ${extractProtocol(packet)}<br>Time: ${utcTime}`;
+        
+        // Add sequence and acknowledgment numbers if available
+        if (packet.seq_num !== undefined && packet.seq_num !== null) {
+            tooltipContent += `<br>Seq: ${packet.seq_num}`;
+        }
+        if (packet.ack_num !== undefined && packet.ack_num !== null) {
+            tooltipContent += `<br>Ack: ${packet.ack_num}`;
+        }
+        
+        return tooltipContent;
+    }
+}
+
+function getVisiblePackets(packets, xScale) {
+    if (!packets || packets.length === 0) return [];
+    
+    const domain = xScale.domain();
+    const [minTime, maxTime] = domain;
+    
+    // Only render packets within the visible time range
+    return packets.filter(d => {
+        const timestamp = Math.floor(d.timestamp);
+        return timestamp >= minTime && timestamp <= maxTime;
+    });
+}
+
+function calculateZoomLevel(xScale, timeExtent) {
+    const domain = xScale.domain();
+    const originalRange = timeExtent[1] - timeExtent[0];
+    const currentRange = domain[1] - domain[0];
+    return originalRange / currentRange;
+}
+
+function getBinSize(zoomLevel, timeRangeMicroseconds, basePixelSize = 5) {
+    // If binning is disabled, return 0 to indicate individual packets
+    if (!useBinning) return 0;
+    const timeRangeSeconds = Math.max(1, timeRangeMicroseconds / 1000000); // avoid zero
+    const binSeconds = timeRangeSeconds / getEffectiveBinCount(); // seconds per bin
+    const binMicroseconds = Math.max(1, Math.floor(binSeconds * 1000000));
+    return binMicroseconds;
+}
 
 // Global function to find the correct Y position for an IP (single row per IP)
 function findIPPosition(ip, _src_ip, _dst_ip, _pairs, ipPositions) {
     if (!ipPositions) return 0;
     return ipPositions.get(ip) || 0;
+}
+
+function binPackets(packets, xScale, yScale, timeExtent) {
+    if (!packets || packets.length === 0) return [];
+    
+    const zoomLevel = calculateZoomLevel(xScale, timeExtent);
+    
+    // Calculate the time range of the current visible window
+    const currentDomain = xScale.domain();
+    const currentTimeRange = currentDomain[1] - currentDomain[0]; // Current visible time range
+    
+    // Use only the visible range so we keep ~GLOBAL_BIN_COUNT bins at any zoom level
+    const relevantTimeRange = Math.max(1, currentTimeRange);
+    
+    const binSize = getBinSize(zoomLevel, relevantTimeRange);
+    // When a bin would be smaller than ~1 pixel OR density is < ~1 pkt/bin, show individual packets
+    const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
+    const estBins = Math.max(1, Math.min(getEffectiveBinCount(), Math.floor(typeof width === 'number' ? width : getEffectiveBinCount())));
+    const expectedPktsPerBin = packets.length / estBins;
+    const disableBinning = (binSize === 0) || (binSize <= microsPerPixel) || (expectedPktsPerBin < 1.15);
+    
+    // When binning is disabled, still group overlapping packets by position
+    if (disableBinning) {
+        const positionGroups = new Map();
+        
+        packets.forEach(packet => {
+            const timestamp = Math.floor(packet.timestamp);
+            const yPos = findIPPosition(packet.src_ip, packet.src_ip, packet.dst_ip, pairs, ipPositions);
+            const flagType = classifyFlags(packet.flags);
+            
+            // Group by exact timestamp, Y position, and flag type to avoid overlapping
+            const positionKey = `${timestamp}_${yPos}_${flagType}`;
+            
+            if (!positionGroups.has(positionKey)) {
+                positionGroups.set(positionKey, {
+                    timestamp: packet.timestamp,
+                    src_ip: packet.src_ip,
+                    dst_ip: packet.dst_ip,
+                    flags: packet.flags,
+                    flagType: flagType,
+                    yPos: yPos,
+                    count: 0,
+                    originalPackets: [],
+                    binned: false, // Mark as not binned to preserve individual timing
+                    totalBytes: 0
+                });
+            }
+            
+            const group = positionGroups.get(positionKey);
+            group.count++;
+            group.originalPackets.push(packet);
+            group.totalBytes += (packet.length || 0);
+        });
+        
+        return Array.from(positionGroups.values());
+    }
+    
+    // Analyze connection patterns to determine if binning is beneficial
+    const connectionCounts = new Map();
+    packets.forEach(packet => {
+        const key = `${packet.src_ip}-${packet.dst_ip}`;
+        connectionCounts.set(key, (connectionCounts.get(key) || 0) + 1);
+    });
+    
+    // If most connections have very few packets, reduce binning
+    const totalConnections = connectionCounts.size;
+    const sparseConnections = Array.from(connectionCounts.values()).filter(count => count <= 3).length;
+    const sparseRatio = sparseConnections / totalConnections;
+    
+    let adjustedBinSize = binSize;
+    if (sparseRatio > 0.7) {
+        adjustedBinSize = Math.max(binSize / 4, 100000);
+    } else if (sparseRatio > 0.5) {
+        adjustedBinSize = Math.max(binSize / 2, 200000);
+    }
+    
+    // Group packets by time bins, Y position, and flag type
+    const bins = new Map();
+    
+    packets.forEach(packet => {
+        const timestamp = Math.floor(packet.timestamp);
+        const timeBin = Math.floor(timestamp / adjustedBinSize) * adjustedBinSize;
+        
+        const yPos = findIPPosition(packet.src_ip, packet.src_ip, packet.dst_ip, pairs, ipPositions);
+        const flagType = classifyFlags(packet.flags);
+        
+        const binKey = `${timeBin}_${yPos}_${flagType}`;
+        
+        if (!bins.has(binKey)) {
+            bins.set(binKey, {
+                timestamp: packet.timestamp, // Preserve first packet timestamp for tooltips
+                binTimestamp: timeBin, // Bin start timestamp
+                binCenter: timeBin + Math.floor(adjustedBinSize / 2), // Stable center for rendering
+                src_ip: packet.src_ip,
+                dst_ip: packet.dst_ip,
+                flags: packet.flags,
+                flagType: flagType,
+                yPos: yPos,
+                count: 0,
+                originalPackets: [],
+                binned: true,
+                totalBytes: 0
+            });
+        }
+        
+        const bin = bins.get(binKey);
+        bin.count++;
+        bin.originalPackets.push(packet);
+        bin.totalBytes += (packet.length || 0);
+    });
+    
+    const binnedData = Array.from(bins.values());
+    
+    // For bins with only 1 packet, treat them as unbinned to preserve visibility
+    let singlePacketBins = 0;
+    binnedData.forEach(bin => {
+        if (bin.count === 1) {
+            bin.binned = false;
+            bin.originalPackets = [bin.originalPackets[0]];
+            singlePacketBins++;
+        }
+    });
+    
+    return binnedData;
 }
 
 // Async CSV parsing with progress tracking
@@ -2215,13 +2971,16 @@ function handleFileLoad(event) {
                 
                 // Verify flow-packet connection
                 verifyFlowPacketConnection(packets, flowsFromCSV);
-                // Initialize web worker after packets parsed - will sync with rendered data later
+                // Initialize web worker after packets parsed
                 try {
                     try { sbUpdateCsvProgress(0.95, 'Initializing web worker...'); } catch (_) {}
-                    if (!workerManager) {
-                        initializeWorkerManager();
+                    initPacketWorker();
+                    // Assign stable index for each packet corresponding to position in filteredData later
+                    packets.forEach((p, i) => p._packetIndex = i);
+                    if (packetWorker) {
+                        packetWorkerReady = false; // wait for ready response
+                        packetWorker.postMessage({ type: 'init', packets });
                     }
-                    // Don't init packets here - will sync with rendered data after visualization is built
                 } catch (err) {
                     console.error('Worker init failed', err);
                 }
@@ -2242,6 +3001,152 @@ function handleFileLoad(event) {
         }
     };
     reader.readAsText(file);
+}
+
+// Chunked, async reconstruction to allow UI progress updates
+async function reconstructFlowsFromCSVAsync(packets, onProgress) {
+    const flowMap = new Map();
+    const total = Array.isArray(packets) ? packets.length : 0;
+    const BATCH = Math.max(1000, Number(FLOW_RECONSTRUCT_BATCH) || 5000);
+    let processed = 0;
+    for (let start = 0; start < total; start += BATCH) {
+        const end = Math.min(total, start + BATCH);
+        for (let i = start; i < end; i++) {
+            const packet = packets[i];
+            const flowId = packet.flow_id;
+            if (!flowId || flowId === '') continue;
+            if (!flowMap.has(flowId)) {
+                flowMap.set(flowId, {
+                    id: flowId,
+                    key: makeConnectionKey(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port),
+                    initiator: packet.src_ip,
+                    responder: packet.dst_ip,
+                    initiatorPort: parseInt(packet.src_port) || 0,
+                    responderPort: parseInt(packet.dst_port) || 0,
+                    state: packet.flow_state || 'unknown',
+                    establishmentComplete: packet.establishment_complete === true,
+                    dataTransferStarted: packet.data_transfer_started === true,
+                    closingStarted: packet.closing_started === true,
+                    closeType: packet.flow_close_type || null,
+                    startTime: parseInt(packet.flow_start_time) || packet.timestamp,
+                    endTime: parseInt(packet.flow_end_time) || packet.timestamp,
+                    totalPackets: parseInt(packet.flow_total_packets) || 1,
+                    totalBytes: parseInt(packet.flow_total_bytes) || 0,
+                    invalidReason: packet.flow_invalid_reason || null,
+                    phases: { establishment: [], dataTransfer: [], closing: [] }
+                });
+            } else {
+                const flow = flowMap.get(flowId);
+                flow.startTime = Math.min(flow.startTime, packet.timestamp);
+                flow.endTime = Math.max(flow.endTime, packet.timestamp);
+                if (packet.flow_total_packets) {
+                    const newPackets = parseInt(packet.flow_total_packets);
+                    if (!isNaN(newPackets)) flow.totalPackets = newPackets;
+                }
+                if (packet.flow_total_bytes) {
+                    const newBytes = parseInt(packet.flow_total_bytes);
+                    if (!isNaN(newBytes)) flow.totalBytes = newBytes;
+                }
+            }
+        }
+        processed = end;
+        if (typeof onProgress === 'function') onProgress(processed, total);
+        // Yield to the event loop to update the DOM
+        await new Promise(r => setTimeout(r, 0));
+    }
+    const flows = Array.from(flowMap.values());
+    LOG(`Reconstructed ${flows.length} flows from ${packets.length} packets`);
+    return flows;
+}
+
+function reconstructFlowsFromCSV(packets) {
+    const flowMap = new Map();
+    let processedCount = 0;
+    
+    packets.forEach((packet, index) => {
+        const flowId = packet.flow_id;
+        if (!flowId || flowId === '') return;
+        
+        if (!flowMap.has(flowId)) {
+            // Create new flow entry based on packet data
+            const flowData = {
+                id: flowId,
+                key: makeConnectionKey(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port),
+                initiator: packet.src_ip,
+                responder: packet.dst_ip,
+                initiatorPort: parseInt(packet.src_port) || 0,
+                responderPort: parseInt(packet.dst_port) || 0,
+                state: packet.flow_state || 'unknown',
+                establishmentComplete: packet.establishment_complete === true,
+                dataTransferStarted: packet.data_transfer_started === true,
+                closingStarted: packet.closing_started === true,
+                closeType: packet.flow_close_type || null,
+                startTime: parseInt(packet.flow_start_time) || packet.timestamp,
+                endTime: parseInt(packet.flow_end_time) || packet.timestamp,
+                totalPackets: parseInt(packet.flow_total_packets) || 1,
+                totalBytes: parseInt(packet.flow_total_bytes) || 0,
+                invalidReason: packet.flow_invalid_reason || null,
+                phases: {
+                    establishment: [],
+                    dataTransfer: [],
+                    closing: []
+                }
+            };
+            
+            flowMap.set(flowId, flowData);
+            processedCount++;
+        } else {
+            // Update existing flow with any new information
+            const flow = flowMap.get(flowId);
+            flow.startTime = Math.min(flow.startTime, packet.timestamp);
+            flow.endTime = Math.max(flow.endTime, packet.timestamp);
+            if (packet.flow_total_packets) {
+                const newPackets = parseInt(packet.flow_total_packets);
+                if (!isNaN(newPackets)) flow.totalPackets = newPackets;
+            }
+            if (packet.flow_total_bytes) {
+                const newBytes = parseInt(packet.flow_total_bytes);
+                if (!isNaN(newBytes)) flow.totalBytes = newBytes;
+            }
+        }
+    });
+    
+    const flows = Array.from(flowMap.values());
+    LOG(`Reconstructed ${flows.length} flows from ${packets.length} packets`);
+    return flows;
+}
+
+function verifyFlowPacketConnection(packets, flows) {
+    LOG('=== Flow-Packet Connection Verification ===');
+    
+    // Create a map of packet connection keys
+    const packetKeys = new Set();
+    const packetKeyCount = new Map();
+    
+    packets.forEach(packet => {
+        const key = makeConnectionKey(packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port);
+        packetKeys.add(key);
+        packetKeyCount.set(key, (packetKeyCount.get(key) || 0) + 1);
+    });
+    
+    LOG(`Found ${packetKeys.size} unique packet connection keys`);
+    
+    // Check each flow against packet keys
+    let matchedFlows = 0;
+    let unmatchedFlows = 0;
+    
+    flows.forEach(flow => {
+        const flowKey = flow.key;
+        if (packetKeys.has(flowKey)) {
+            matchedFlows++;
+            LOG(`✓ Flow ${flow.id} matches packets (${packetKeyCount.get(flowKey)} packets)`);
+        } else {
+            unmatchedFlows++;
+            LOG(`✗ Flow ${flow.id} has no matching packets (key: ${flowKey})`);
+        }
+    });
+    
+    LOG(`Flow verification: ${matchedFlows} matched, ${unmatchedFlows} unmatched`);
 }
 
 function highlight(selected) {
@@ -2588,16 +3493,7 @@ function visualizeTimeArcs(packets) {
                     if (dynamicLayer) dynamicLayer.selectAll('.direction-dot').remove();
                     return;
                 }
-                binnedPackets = binPackets(visiblePackets, {
-                    xScale,
-                    timeExtent,
-                    findIPPosition,
-                    ipPositions,
-                    pairs,
-                    binCount: getEffectiveBinCount(GLOBAL_BIN_COUNT, renderMode),
-                    useBinning,
-                    width
-                });
+                binnedPackets = binPackets(visiblePackets, xScale, yScale, timeExtent);
                 if (atFullDomain && !flowsFilteringActive) {
                     fullDomainBinsCache = { version: dataVersion, data: binnedPackets, binSize: null, sorted: false };
                 }
@@ -2619,26 +3515,71 @@ function visualizeTimeArcs(packets) {
             }
             try { updateZoomDurationLabel(); } catch(_) {}
             let rScale = d3.scaleSqrt().domain([1, Math.max(1, globalMaxBinCount)]).range([RADIUS_MIN, RADIUS_MAX]);
-            renderMarksForLayerLocal(dynamicLayer, binnedPackets, rScale);
+            renderMarksForLayer(dynamicLayer, binnedPackets, rScale);
+
+            // Clear cached bins so re-render uses new y positions
+            try { fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false }; } catch(_) {}
+            // Trigger a lightweight re-render at current zoom domain
+            try { isHardResetInProgress = true; applyZoomDomain(xScale.domain(), 'program'); } catch(_) {}
+
+            // Redraw arcs and ground truth with updated positions
+            try { drawSelectedFlowArcs(); } catch(_) {}
+            try {
+                const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value);
+                drawGroundTruthBoxes(selectedIPs);
+            } catch(_) {}
+            try { updateZoomDurationLabel(); } catch(_) {}
         });
     };
 
-    // Initialize zoom now that zoomed() exists - using module function
-    zoom = createZoomBehavior({
-        d3,
-        scaleExtent: [1, 1e9],
-        onZoom: zoomed
-    });
+    // Initialize zoom now that zoomed() exists
+    zoom = d3.zoom()
+        .filter((event) => {
+            if (!event) return true;
+            if (event.type === 'wheel') return event.ctrlKey || event.metaKey || event.shiftKey;
+            return true;
+        })
+        .scaleExtent([1, 1e9])
+        .on('zoom', zoomed);
     zoomTarget = svgContainer;
     zoomTarget.call(zoom);
 
-    // Enable drag-to-reorder for IP rows using module function
-    const dragBehavior = createDragReorderBehavior({
-        d3,
-        svg,
-        ipOrder,
-        ipPositions,
-        onReorder: () => {
+    // Enable drag-to-reorder for IP rows (ported from arc diagram implementation)
+    // This restores the ability to vertically reorder IP rows by dragging their labels.
+    const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+    const dragBehavior = d3.drag()
+        .on('start', function (event, ip) {
+            try { d3.select(this).raise(); } catch(_) {}
+            d3.select(this).style('cursor', 'grabbing');
+        })
+        .on('drag', function (event, ip) {
+            // event.y is relative to the group this drag is applied in (the margin-translated svg group)
+            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
+            const y = clamp(event.y, TOP_PAD, maxY);
+            d3.select(this).attr('transform', `translate(0,${y})`);
+        })
+        .on('end', function (event, ip) {
+            const maxY = TOP_PAD + ROW_GAP * (ipOrder.length - 1);
+            const y = clamp(event.y, TOP_PAD, maxY);
+            let targetIdx = Math.round((y - TOP_PAD) / ROW_GAP);
+            targetIdx = Math.max(0, Math.min(ipOrder.length - 1, targetIdx));
+
+            const fromIdx = ipOrder.indexOf(ip);
+            if (fromIdx === -1) return;
+            if (fromIdx !== targetIdx) {
+                // Reorder ipOrder array
+                ipOrder.splice(fromIdx, 1);
+                ipOrder.splice(targetIdx, 0, ip);
+                // Rebuild y position lookup
+                ipOrder.forEach((p, i) => ipPositions.set(p, TOP_PAD + i * ROW_GAP));
+            }
+
+            // Animate row labels into their new slots
+            svg.selectAll('.node')
+                .transition().duration(150)
+                .attr('transform', d => `translate(0,${ipPositions.get(d)})`)
+                .on('end', function () { d3.select(this).style('cursor', 'grab'); });
+
             // Invalidate cached full-domain bins so subsequent renders recompute with updated y positions
             try { fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false }; } catch(_) {}
             // Force a lightweight re-render at current zoom domain (will trigger zoom handler logic)
@@ -2653,8 +3594,7 @@ function visualizeTimeArcs(packets) {
                 }
             } catch(_) {}
             try { updateZoomDurationLabel(); } catch(_) {}
-        }
-    });
+        });
     svg.selectAll('.node').call(dragBehavior).style('cursor', 'grab');
 
     let initialVisiblePackets = getVisiblePackets(packets, xScale);
@@ -2667,16 +3607,7 @@ function visualizeTimeArcs(packets) {
         });
     }
 
-    const initialBinnedPackets = binPackets(initialVisiblePackets, {
-        xScale,
-        timeExtent,
-        findIPPosition,
-        ipPositions,
-        pairs,
-        binCount: getEffectiveBinCount(GLOBAL_BIN_COUNT, renderMode),
-        useBinning,
-        width
-    });
+    const initialBinnedPackets = binPackets(initialVisiblePackets, xScale, yScale, timeExtent);
     try {
         const counts = initialBinnedPackets.filter(d => d.binned && d.count > 0).map(d => d.count);
         const maxCount = counts.length > 0 ? Math.max(...counts) : 1;
@@ -2697,20 +3628,12 @@ function visualizeTimeArcs(packets) {
     });
     fullDomainBinsCache.sorted = true;
 
-    renderMarksForLayerLocal(fullDomainLayer, initialBinnedPackets, initialRScale);
+    renderMarksForLayer(fullDomainLayer, initialBinnedPackets, initialRScale);
 
     if (fullDomainLayer) fullDomainLayer.style("display", null);
     if (dynamicLayer) dynamicLayer.style("display", "none");
 
     updateTcpFlowPacketsGlobal();
-    
-    // Sync worker with rendered data after initial rendering
-    try {
-        setTimeout(() => syncWorkerWithRenderedData(), 100); // Small delay to ensure DOM is updated
-    } catch (err) {
-        console.error('Failed to sync worker after initial render:', err);
-    }
-    
     // Draw size + flag legends into bottom overlay (fixed position)
     try { drawSizeLegend(bottomOverlayRoot, width, bottomOverlayHeight); } catch (_) {}
     try { drawFlagLegend(); } catch (_) {}
@@ -2735,6 +3658,81 @@ function visualizeTimeArcs(packets) {
             return date.toISOString().split('T')[1].split('.')[0];
         }));
     } catch(_) {}
+}
+
+function makeConnectionKey(src_ip, src_port, dst_ip, dst_port) {
+    const sp = (src_port === undefined || src_port === null || isNaN(src_port)) ? 0 : src_port;
+    const dp = (dst_port === undefined || dst_port === null || isNaN(dst_port)) ? 0 : dst_port;
+    const a = `${src_ip}:${sp}-${dst_ip}:${dp}`;
+    const b = `${dst_ip}:${dp}-${src_ip}:${sp}`;
+    return a < b ? a : b;
+}
+
+function exportFlowToCSV(flow) {
+    try {
+        // Collect packets for this flow from fullData (use entire dataset, not only filtered)
+        const key = flow.key || makeConnectionKey(flow.initiator, flow.initiatorPort, flow.responder, flow.responderPort);
+        const packets = (fullData || []).filter(p => {
+            if (!(p.src_ip && p.dst_ip && p.src_port && p.dst_port)) return false;
+            return makeConnectionKey(p.src_ip, p.src_port, p.dst_ip, p.dst_port) === key;
+        });
+
+        if (packets.length === 0) {
+            alert('No packets found for this flow.');
+            return;
+        }
+
+        // Deduplicate
+        const dedupMap = new Map();
+        packets.forEach(p => {
+            const k = [
+                Math.floor(p.timestamp), p.src_ip, p.src_port, p.dst_ip, p.dst_port,
+                p.flags, p.seq_num ?? '', p.ack_num ?? '', p.length ?? ''
+            ].join('|');
+            if (!dedupMap.has(k)) dedupMap.set(k, p);
+        });
+        const deduped = Array.from(dedupMap.values()).sort((a, b) => a.timestamp - b.timestamp);
+
+        // Build CSV
+        const headers = [
+            'timestamp', 'utc_time', 'src_ip', 'src_port', 'dst_ip', 'dst_port',
+            'flags', 'flag_type', 'seq_num', 'ack_num', 'length'
+        ];
+        const lines = [headers.join(',')];
+        deduped.forEach(p => {
+            const { utcTime } = formatTimestamp(Math.floor(p.timestamp));
+            const row = [
+                Math.floor(p.timestamp),
+                `"${utcTime}"`,
+                p.src_ip,
+                p.src_port,
+                p.dst_ip,
+                p.dst_port,
+                p.flags ?? '',
+                `"${(p.flag_type || classifyFlags(p.flags) || '').toString()}"`,
+                p.seq_num ?? '',
+                p.ack_num ?? '',
+                p.length ?? ''
+            ].join(',');
+            lines.push(row);
+        });
+
+        const csvContent = lines.join('\n');
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const safeInitiator = (flow.initiator || 'unknown').replace(/[^\w.:-]/g, '_');
+        const safeResponder = (flow.responder || 'unknown').replace(/[^\w.:-]/g, '_');
+        a.href = url;
+        a.download = `flow_${safeInitiator}_${flow.initiatorPort}_to_${safeResponder}_${flow.responderPort}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        console.error('Failed to export CSV:', err);
+        alert('Failed to export CSV. See console for details.');
+    }
 }
 
 // Make resize handler available globally for testing and debugging
@@ -2781,9 +3779,10 @@ function cleanup() {
     }
     
     // Terminate worker if exists
-    if (workerManager) {
-        workerManager.terminate();
-        workerManager = null;
+    if (packetWorker) {
+        packetWorker.terminate();
+        packetWorker = null;
+        packetWorkerReady = false;
     }
     
     // Reset global state
@@ -2814,20 +3813,7 @@ function init() {
     initializeBarVisualization();
     
     // Load ground truth data in the background
-    // Load ground truth data asynchronously
-    loadGroundTruthData().then(data => {
-        groundTruthData = data;
-        
-        // Update ground truth stats display
-        const container = document.getElementById('groundTruthStats');
-        if (data.length > 0) {
-            container.innerHTML = `Loaded ${data.length} ground truth events<br>Select 2+ IPs to view matching events`;
-            container.style.color = '#27ae60';
-        } else {
-            container.innerHTML = 'Ground truth data not loaded';
-            container.style.color = '#e74c3c';
-        }
-    });
+    loadGroundTruthData();
 }
 
 // Handle folder data loaded event
@@ -2890,10 +3876,13 @@ function handleFolderDataLoaded(event) {
         
         // Initialize web worker for packet filtering
         try {
-            if (!workerManager) {
-                initializeWorkerManager();
+            initPacketWorker();
+            // Assign stable index for each packet
+            packets.forEach((p, i) => p._packetIndex = i);
+            if (packetWorker) {
+                packetWorkerReady = false;
+                packetWorker.postMessage({ type: 'init', packets });
             }
-            // Will sync with rendered data after visualization is built
         } catch (err) {
             console.error('Worker init failed', err);
         }
