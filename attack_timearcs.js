@@ -6,7 +6,7 @@ import { linkArc, gradientIdForLink } from './src/rendering/arcPath.js';
 import { buildLegend as createLegend, updateLegendVisualState as updateLegendUI, isolateAttack as isolateLegendAttack } from './src/ui/legend.js';
 import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
 import { detectTimestampUnit, createToDateConverter, createTimeScale, createIpScale, createWidthScale, calculateMaxArcRadius } from './src/scales/scaleFactory.js';
-import { createForceSimulation, runUntilConverged, createComponentSeparationForce, createWeakComponentSeparationForce, createComponentCohesionForce, createHubCenteringForce, createComponentYForce, initializeNodePositions, calculateComponentCenters, findComponentHubIps, calculateIpDegrees } from './src/layout/forceSimulation.js';
+import { createForceSimulation, runUntilConverged, createComponentSeparationForce, createWeakComponentSeparationForce, createComponentCohesionForce, createHubCenteringForce, createComponentYForce, initializeNodePositions, calculateComponentCenters, findComponentHubIps, calculateIpDegrees, calculateConnectionStrength, createMutualHubAttractionForce } from './src/layout/forceSimulation.js';
 import { applyLens1D, createLensXScale, createFisheyeScale, createHorizontalFisheyeScale, fisheyeDistort } from './src/scales/distortion.js';
 import { computeIpSpans, createSpanData, renderRowLines, renderIpLabels, createLabelHoverHandler, createLabelMoveHandler, createLabelLeaveHandler, attachLabelHoverHandlers } from './src/rendering/rows.js';
 import { createArcHoverHandler, createArcMoveHandler, createArcLeaveHandler, attachArcHandlers } from './src/rendering/arcInteractions.js';
@@ -38,6 +38,9 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
     const sel = Array.from(labelModeRadios).find(r=>r.checked);
     labelMode = sel ? sel.value : 'attack';
     if (lastRawCsvRows) {
+      // Reset to show all data when switching label modes
+      originalData = null; // Force re-storing of original data
+      visibleAttacks.clear(); // Clear visible attacks so render() re-initializes
       render(rebuildDataFromRawRows(lastRawCsvRows));
     }
   }));
@@ -159,14 +162,18 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
   let visibleAttacks = new Set(); // Set of attack names that are currently visible
   let currentArcPaths = null; // Reference to arc paths selection for visibility updates
   let currentLabelMode = 'attack'; // Track current label mode for filtering
-  
+
   // Reference to updateLensVisualization function so slider can trigger updates
   let updateLensVisualizationFn = null;
   // Reference to toggleLensing function so button can trigger it
   let toggleLensingFn = null;
-  
+
   // State for last rendered data (for resize re-render)
   let lastRenderedData = null;
+  // Store original unfiltered data for legend filtering
+  let originalData = null;
+  // Flag to track if we're rendering filtered data (to prevent overwriting originalData)
+  let isRenderingFilteredData = false;
   // Cleanup function for resize handler
   let resizeCleanup = null;
 
@@ -400,7 +407,11 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       }
       
       setStatus(statusEl,statusMsg);
-      
+
+      // Reset legend state for new data to ensure proper filtering
+      originalData = null;
+      visibleAttacks.clear();
+
       render(combinedData);
     } catch (err) {
       console.error(err);
@@ -445,6 +456,9 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       console.log('Sample entries:', Array.from(rev.entries()).slice(0, 5));
       setStatus(statusEl,`Custom IP map loaded (${rev.size} entries). Re-rendering…`);
       if (lastRawCsvRows) {
+        // Reset legend state for updated mappings
+        originalData = null;
+        visibleAttacks.clear();
         // rebuild to decode IP ids again
         render(rebuildDataFromRawRows(lastRawCsvRows));
       }
@@ -491,6 +505,9 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       console.log('Sample entries:', Array.from(rev.entries()).slice(0, 5));
       setStatus(statusEl,`Custom event type map loaded (${rev.size} entries). Re-rendering…`);
       if (lastRawCsvRows) {
+        // Reset legend state for updated mappings
+        originalData = null;
+        visibleAttacks.clear();
         // rebuild to decode attack IDs again
         render(rebuildDataFromRawRows(lastRawCsvRows));
       }
@@ -584,14 +601,25 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
 
   // Use d3 formatters consistently; we prefer UTC to match axis
 
-  // Function to update arc visibility based on visible attacks
-  function updateArcVisibility() {
-    if (!currentArcPaths) return;
-    
-    currentArcPaths.style('display', d => {
-      const attackName = (currentLabelMode === 'attack_group' ? d.attack_group : d.attack) || 'normal';
-      return visibleAttacks.has(attackName) ? 'block' : 'none';
+  // Function to filter data based on visible attacks and re-render
+  function applyAttackFilter() {
+    if (!originalData || originalData.length === 0) return;
+
+    // Filter data to only include visible attacks
+    const activeLabelKey = labelMode === 'attack_group' ? 'attack_group' : 'attack';
+    const filteredData = originalData.filter(d => {
+      const attackName = (d[activeLabelKey] || 'normal');
+      return visibleAttacks.has(attackName);
     });
+
+    console.log(`Filtered data: ${filteredData.length} of ${originalData.length} records (${visibleAttacks.size} visible attacks)`);
+
+    // Set flag to prevent overwriting originalData during filtered render
+    isRenderingFilteredData = true;
+    // Re-render with filtered data (this will recompute the entire layout)
+    render(filteredData);
+    // Reset flag after render completes
+    isRenderingFilteredData = false;
   }
 
   function buildLegend(items, colorFn) {
@@ -602,13 +630,13 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         } else {
           visibleAttacks.add(attackName);
         }
-        updateArcVisibility();
         updateLegendUI(legendEl, visibleAttacks);
+        applyAttackFilter(); // Recompute layout with filtered data
       },
       onIsolate: (attackName) => {
         isolateLegendAttack(attackName, visibleAttacks, legendEl);
-        updateArcVisibility();
         updateLegendUI(legendEl, visibleAttacks);
+        applyAttackFilter(); // Recompute layout with filtered data
       }
     });
   }
@@ -616,7 +644,14 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
   function render(data) {
     // Store data for resize re-render
     lastRenderedData = data;
-    
+
+    // Store original data for filtering (only if this is truly new data, not filtered data)
+    // Don't overwrite originalData if we're rendering filtered data
+    if (!isRenderingFilteredData && (!originalData || visibleAttacks.size === 0)) {
+      originalData = data;
+      console.log('Stored original data:', originalData.length, 'records');
+    }
+
     // Determine timestamp handling
     const tsMin = d3.min(data, d => d.timestamp);
     const tsMax = d3.max(data, d => d.timestamp);
@@ -671,11 +706,17 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
     });
   // Determine which label dimension we use (attack vs group) for legend and coloring
   const activeLabelKey = labelMode === 'attack_group' ? 'attack_group' : 'attack';
-    const attacks = Array.from(new Set(links.map(l => l[activeLabelKey] || 'normal'))).sort();
-    
-    // Always enable ALL attacks on each fresh render (e.g., new data loaded)
-    // This ensures the legend starts fully enabled regardless of previous toggles
-    visibleAttacks = new Set(attacks);
+
+    // Build attacks list from ORIGINAL data (not filtered) so legend always shows all attacks
+    const originalLinks = originalData ? computeLinks(originalData) : links;
+    const attacks = Array.from(new Set(originalLinks.map(l => l[activeLabelKey] || 'normal'))).sort();
+
+    // Only initialize visibleAttacks on first render or when switching label modes
+    // This preserves the user's filter selections across re-renders
+    if (visibleAttacks.size === 0 || currentLabelMode !== labelMode) {
+      visibleAttacks = new Set(attacks);
+      console.log('Initialized visibleAttacks with', attacks.length, 'attacks');
+    }
     currentLabelMode = labelMode;
 
     // Sizing based on fixed height (matching main.js: height = 780)
@@ -992,12 +1033,9 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
     });
 
     attachArcHandlers(arcPaths, arcHoverHandler, arcMoveHandler, arcLeaveHandler);
-    
+
     // Store arcPaths reference for legend filtering (after all handlers are attached)
     currentArcPaths = arcPaths;
-    
-    // Apply initial visibility based on visibleAttacks
-    updateArcVisibility();
 
     // Add hover handlers to IP labels to highlight connected arcs
     const labelHoverHandler = createLabelHoverHandler({
@@ -1026,7 +1064,10 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
     
     // Calculate degree (number of connections) for each IP from links using imported function
     const ipDegree = calculateIpDegrees(linksWithNodes);
-    
+
+    // Calculate connection strength (weighted by link counts) for pulling hubs together
+    const connectionStrength = calculateConnectionStrength(linksWithNodes);
+
     // Find hub IPs using imported function
     const componentHubIps = findComponentHubIps(components, ipDegree);
     componentHubIps.forEach((hubIp, compIdx) => {
@@ -1055,27 +1096,45 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       // Use the Y force from the imported function
       simulation.force('y', createComponentYForce(d3, ipToComponent, componentCenters, MARGIN.top + INNER_HEIGHT / 2));
       
-      // Use imported force functions
-      const componentSeparationForce = createComponentSeparationForce(ipToComponent, simNodes);
+      // Use imported force functions with strengthened parameters
+      const componentSeparationForce = createComponentSeparationForce(ipToComponent, simNodes, {
+        separationStrength: 1.8,  // Increased from default 1.2
+        minDistance: 100          // Increased from default 80
+      });
       const componentCohesionForce = createComponentCohesionForce(ipToComponent, simNodes);
       const hubCenteringForce = createHubCenteringForce(componentHubIps, componentCenters, simNodes);
-      
+
+      // Mutual hub attraction: pull IPs with most connections together
+      const hubAttractionForce = createMutualHubAttractionForce(
+        ipToComponent,
+        connectionStrength,
+        simNodes,
+        {
+          attractionStrength: 0.8,  // Strength of mutual attraction
+          hubThreshold: 0.3         // IPs with >30% of max connection strength are hubs
+        }
+      );
+
       // Register the custom forces with the simulation
       simulation.force('componentSeparation', componentSeparationForce);
       simulation.force('componentCohesion', componentCohesionForce);
       simulation.force('hubCentering', hubCenteringForce);
+      simulation.force('hubAttraction', hubAttractionForce);
 
       // Stage 1: Run simulation with strong component separation
-      simulation.alpha(0.3).restart();
-      runUntilConverged(simulation, 300, 0.001);
+      simulation.alpha(0.4).restart();  // Increased from 0.3 for stronger force application
+      runUntilConverged(simulation, 350, 0.001);  // Increased from 300 for better convergence
       
       // Stage 2: Reduce component forces and allow internal optimization
       simulation.force('y').strength(0.4); // Reduce Y force strength
-      simulation.force('componentSeparation', createWeakComponentSeparationForce(ipToComponent, simNodes));
+      simulation.force('componentSeparation', createWeakComponentSeparationForce(ipToComponent, simNodes, {
+        separationStrength: 0.5,  // Increased from default 0.3
+        minDistance: 60           // Increased from default 50
+      }));
       
       // Continue simulation for internal optimization
-      simulation.alpha(0.15).restart();
-      runUntilConverged(simulation, 200, 0.0005);
+      simulation.alpha(0.18).restart();  // Increased from 0.15 for stronger refinement
+      runUntilConverged(simulation, 225, 0.0005);  // Increased from 200 for better convergence
     } else {
       // Single component: use original positioning
       const componentCenter = (MARGIN.top + INNER_HEIGHT) / 2;
@@ -1116,6 +1175,20 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         const singleHubIps = new Map([[0, hubIp]]);
         simulation.force('hubCentering', createHubCenteringForce(singleHubIps, singleComponentCenters, simNodes, { hubStrength: 1.0 }));
       }
+
+      // Add mutual hub attraction for single component
+      const singleIpToComponent = new Map();
+      simNodes.forEach(n => singleIpToComponent.set(n.id, 0));
+      const singleHubAttraction = createMutualHubAttractionForce(
+        singleIpToComponent,
+        connectionStrength,
+        simNodes,
+        {
+          attractionStrength: 0.6,  // Slightly weaker for single component
+          hubThreshold: 0.3
+        }
+      );
+      simulation.force('hubAttraction', singleHubAttraction);
       
       // Run simulation for single component
       simulation.alpha(0.15).restart();
@@ -1145,11 +1218,26 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       }
     });
 
+    // Calculate earliest timestamp for each IP (for chronological ordering)
+    const earliestTime = new Map();
+    linksWithNodes.forEach(link => {
+      const srcIp = link.sourceNode.name;
+      const tgtIp = link.targetNode.name;
+      const time = link.minute;
+
+      if (!earliestTime.has(srcIp) || time < earliestTime.get(srcIp)) {
+        earliestTime.set(srcIp, time);
+      }
+      if (!earliestTime.has(tgtIp) || time < earliestTime.get(tgtIp)) {
+        earliestTime.set(tgtIp, time);
+      }
+    });
+
     // Compact IP positions to eliminate gaps (inspired by detactTimeSeries in main.js)
     // This redistributes IPs evenly across the vertical space while:
     //  - preserving connected-component separation when multiple components exist
-    //  - maintaining each component's internal ordering from the force layout
-    compactIPPositions(simNodes, yMap, MARGIN.top, INNER_HEIGHT, components, ipToComponent);
+    //  - maintaining chronological ordering (earliest attacks at the top)
+    compactIPPositions(simNodes, yMap, MARGIN.top, INNER_HEIGHT, components, ipToComponent, earliestTime);
 
     // Ensure all IPs in allIps have positions in yMap (safety check for any edge cases)
     // This handles any IPs that might not be in simNodes
@@ -2018,32 +2106,91 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
   // When information about connected components is available, we keep each
   // disconnected component in its own contiguous vertical block so that
   // isolated clusters of IPs/links do not get interleaved visually.
-  // Similar in spirit to detactTimeSeries() in main.js.
-  function compactIPPositions(simNodes, yMap, topMargin, INNER_HEIGHT, components, ipToComponent) {
-    // Simple uniform spacing (like main.js detactTimeSeries)
-    // Collect all IPs and sort by their current Y positions
-    const ipArray = [];
-    simNodes.forEach(n => {
-      const yPos = yMap.get(n.id);
-      if (yPos !== undefined && isFinite(yPos)) {
-        ipArray.push({ ip: n.id, y: yPos });
+  // IPs are ordered chronologically (earliest attacks at the top).
+  function compactIPPositions(simNodes, yMap, topMargin, INNER_HEIGHT, components, ipToComponent, earliestTime) {
+    const numIPs = simNodes.length;
+    if (numIPs === 0) return;
+
+    // Handle single component case with chronological ordering
+    if (components.length <= 1) {
+      const ipArray = [];
+      simNodes.forEach(n => {
+        const time = earliestTime.get(n.id) || Infinity;
+        ipArray.push({ ip: n.id, time: time });
+      });
+
+      // Sort by earliest time (ascending - earliest first = top)
+      ipArray.sort((a, b) => a.time - b.time);
+
+      const step = Math.min((INNER_HEIGHT - 25) / (ipArray.length + 1), 15);
+      ipArray.forEach((item, i) => {
+        const newY = topMargin + 12 + i * step;
+        yMap.set(item.ip, newY);
+      });
+
+      console.log(`Compacted ${ipArray.length} IPs chronologically with ${step.toFixed(2)}px spacing`);
+      return;
+    }
+
+    // Multi-component: preserve separation by grouping IPs by component
+
+    // Step 1: Group IPs by component and sort within each component by earliest time
+    const componentIpGroups = components.map((comp, idx) => {
+      const ipsInComponent = [];
+      simNodes.forEach(n => {
+        if (ipToComponent.get(n.id) === idx) {
+          const time = earliestTime.get(n.id) || Infinity;
+          ipsInComponent.push({ ip: n.id, time: time });
+        }
+      });
+      // Sort within component by chronological order (earliest first = top)
+      ipsInComponent.sort((a, b) => a.time - b.time);
+
+      // Calculate component's earliest time (minimum of all IPs in component)
+      const componentEarliestTime = ipsInComponent.length > 0
+        ? Math.min(...ipsInComponent.map(item => item.time))
+        : Infinity;
+
+      return {
+        ips: ipsInComponent,
+        earliestTime: componentEarliestTime,
+        componentIndex: idx
+      };
+    });
+
+    // Sort components by earliest time (earliest component at top)
+    componentIpGroups.sort((a, b) => a.earliestTime - b.earliestTime);
+
+    // Step 2: Calculate space allocation
+    const minIPSpacing = 15;
+    const interComponentGap = 25; // Explicit gap between components
+
+    const numGaps = components.length - 1;
+    const spaceForGaps = numGaps * interComponentGap;
+    const spaceForIPs = INNER_HEIGHT - 25 - spaceForGaps;
+
+    // Calculate IP spacing (may be less than minIPSpacing if crowded)
+    const ipStep = Math.max(
+      Math.min(spaceForIPs / (numIPs + 1), minIPSpacing),
+      8 // Absolute minimum to prevent overlap
+    );
+
+    // Step 3: Position IPs component-by-component (in chronological order)
+    let currentY = topMargin + 12;
+
+    componentIpGroups.forEach((compGroup, idx) => {
+      compGroup.ips.forEach((item, i) => {
+        yMap.set(item.ip, currentY);
+        currentY += ipStep;
+      });
+
+      // Add inter-component gap (except after last component)
+      if (idx < componentIpGroups.length - 1) {
+        currentY += interComponentGap;
       }
     });
 
-    ipArray.sort((a, b) => a.y - b.y);
-
-    const numIPs = ipArray.length;
-    if (numIPs === 0) return;
-
-    // Uniform spacing across full height
-    const step = Math.min((INNER_HEIGHT - 25) / (numIPs + 1), 15);
-
-    ipArray.forEach((item, i) => {
-      const newY = topMargin + 12 + i * step;
-      yMap.set(item.ip, newY);
-    });
-
-    console.log(`Compacted ${numIPs} IPs with uniform step size ${step.toFixed(2)}px`);
+    console.log(`Compacted ${numIPs} IPs across ${components.length} components chronologically (${ipStep.toFixed(2)}px spacing, ${interComponentGap}px gaps)`);
   }
 
   // Order nodes like the TSX component:

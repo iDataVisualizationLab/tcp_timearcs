@@ -427,3 +427,107 @@ export function calculateIpDegrees(links) {
   });
   return ipDegree;
 }
+
+/**
+ * Calculate total connection strength (weighted by link counts) for each IP.
+ * @param {Object[]} links - Links with count property
+ * @returns {Map} - Map of IP to total connection strength
+ */
+export function calculateConnectionStrength(links) {
+  const strength = new Map();
+  links.forEach(l => {
+    const srcName = l.sourceNode?.name || l.source;
+    const tgtName = l.targetNode?.name || l.target;
+    const weight = l.count || 1;
+    strength.set(srcName, (strength.get(srcName) || 0) + weight);
+    strength.set(tgtName, (strength.get(tgtName) || 0) + weight);
+  });
+  return strength;
+}
+
+/**
+ * Create mutual hub attraction force.
+ * Creates mutual attraction between IPs with high connection counts,
+ * pulling them together into tight clusters. This creates a natural
+ * "core-periphery" structure where hubs cluster together.
+ *
+ * @param {Map} ipToComponent - Map of IP to component index
+ * @param {Map} connectionStrength - Map of IP to total connection strength
+ * @param {Object[]} simNodes - Simulation nodes
+ * @param {Object} params - Force parameters
+ * @returns {Function} - Force function for d3
+ */
+export function createMutualHubAttractionForce(ipToComponent, connectionStrength, simNodes, params = {}) {
+  const { attractionStrength = 0.8, hubThreshold = 0.3 } = params;
+
+  // Normalize connection strengths per component (0-1 scale)
+  const normalizedStrength = new Map();
+  const componentMaxStrength = new Map();
+
+  // Find max strength per component
+  simNodes.forEach(n => {
+    const compIdx = ipToComponent.get(n.id) || 0;
+    const strength = connectionStrength.get(n.id) || 0;
+    const currentMax = componentMaxStrength.get(compIdx) || 0;
+    componentMaxStrength.set(compIdx, Math.max(currentMax, strength));
+  });
+
+  // Normalize strengths (0-1 within each component)
+  simNodes.forEach(n => {
+    const compIdx = ipToComponent.get(n.id) || 0;
+    const strength = connectionStrength.get(n.id) || 0;
+    const maxStrength = componentMaxStrength.get(compIdx) || 1;
+    normalizedStrength.set(n.id, maxStrength > 0 ? strength / maxStrength : 0);
+  });
+
+  // Identify hub nodes (above threshold in normalized strength)
+  const isHub = new Map();
+  simNodes.forEach(n => {
+    const normStr = normalizedStrength.get(n.id) || 0;
+    isHub.set(n.id, normStr >= hubThreshold);
+  });
+
+  return (alpha) => {
+    // Create mutual attraction between hub nodes in the same component
+    for (let i = 0; i < simNodes.length; i++) {
+      const nodeA = simNodes[i];
+      const isHubA = isHub.get(nodeA.id);
+      if (!isHubA) continue; // Skip non-hub nodes
+
+      const compA = ipToComponent.get(nodeA.id) || 0;
+      const strengthA = normalizedStrength.get(nodeA.id) || 0;
+
+      for (let j = i + 1; j < simNodes.length; j++) {
+        const nodeB = simNodes[j];
+        const isHubB = isHub.get(nodeB.id);
+        if (!isHubB) continue; // Skip non-hub nodes
+
+        const compB = ipToComponent.get(nodeB.id) || 0;
+
+        // Only attract hubs within the same component
+        if (compA !== compB) continue;
+
+        const strengthB = normalizedStrength.get(nodeB.id) || 0;
+
+        // Calculate attraction force
+        const dx = (nodeB.x || 0) - (nodeA.x || 0);
+        const dy = (nodeB.y || 0) - (nodeA.y || 0);
+        const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+
+        // Attraction strength proportional to product of connection strengths
+        // Strong hubs attract each other more strongly
+        const combinedStrength = strengthA * strengthB;
+        const force = combinedStrength * attractionStrength * alpha * Math.min(distance / 50, 1);
+
+        const fx = (dx / distance) * force;
+        const fy = (dy / distance) * force;
+
+        // Apply attraction (pull nodes toward each other)
+        nodeA.vx = (nodeA.vx || 0) + fx;
+        nodeA.vy = (nodeA.vy || 0) + fy;
+        nodeB.vx = (nodeB.vx || 0) - fx;
+        nodeB.vy = (nodeB.vy || 0) - fy;
+      }
+    }
+  };
+}
