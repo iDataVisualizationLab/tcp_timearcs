@@ -1,5 +1,8 @@
 // src/scales/distortion.js
 // Fisheye and lens distortion functions
+// Now includes D3 fisheye plugin support with Cartesian distortion
+
+import { fisheyeScale, createCartesianFisheye } from '../plugins/d3-fisheye.js';
 
 /**
  * Apply 1D lens transformation.
@@ -250,6 +253,116 @@ export function createHorizontalFisheyeScale(params) {
       const distortedT = horizontalFisheyeDistort(t, focusT, distortion);
       
       return xStart + distortedT * totalWidth;
+    }
+  };
+}
+
+/**
+ * Create D3 fisheye scale for horizontal (X-axis) distortion using the D3 fisheye plugin.
+ * This uses the proper D3 fisheye plugin with Cartesian distortion.
+ * @param {Object} params
+ * @param {Function} params.xScale - D3 scale for X-axis (e.g., d3.scaleTime())
+ * @param {number} params.distortion - Distortion factor (default: 3)
+ * @param {Function} params.getDistortion - Optional getter function for dynamic distortion
+ * @returns {Function} D3 fisheye scale function
+ */
+export function createD3FisheyeXScale(params) {
+  const { xScale, distortion = 3, getDistortion } = params;
+  
+  // Create base fisheye scale
+  let fisheyeX = fisheyeScale(xScale, getDistortion ? getDistortion() : distortion, 0);
+  
+  return function(timestamp) {
+    // Update distortion if getter is provided
+    if (getDistortion) {
+      const currentDistortion = getDistortion();
+      if (fisheyeX.distortion() !== currentDistortion) {
+        fisheyeX = fisheyeScale(xScale, currentDistortion, fisheyeX.focus());
+      }
+    }
+    
+    // Apply fisheye to timestamp
+    return fisheyeX(timestamp);
+  };
+}
+
+/**
+ * Create D3 fisheye scale for vertical (Y-axis) distortion using the D3 fisheye plugin.
+ * This uses the proper D3 fisheye plugin with Cartesian distortion.
+ * @param {Object} params
+ * @param {Function} params.yScale - D3 scale for Y-axis (e.g., d3.scalePoint() or d3.scaleLinear())
+ * @param {number} params.distortion - Distortion factor (default: 3)
+ * @param {Function} params.getDistortion - Optional getter function for dynamic distortion
+ * @returns {Function} D3 fisheye scale function
+ */
+export function createD3FisheyeYScale(params) {
+  const { yScale, distortion = 3, getDistortion } = params;
+  
+  // Create base fisheye scale
+  let fisheyeY = fisheyeScale(yScale, getDistortion ? getDistortion() : distortion, 0);
+  
+  return function(value) {
+    // Update distortion if getter is provided
+    if (getDistortion) {
+      const currentDistortion = getDistortion();
+      if (fisheyeY.distortion() !== currentDistortion) {
+        fisheyeY = fisheyeScale(yScale, currentDistortion, fisheyeY.focus());
+      }
+    }
+    
+    // Apply fisheye to value
+    return fisheyeY(value);
+  };
+}
+
+/**
+ * Create Cartesian fisheye scales for both X and Y axes using D3 fisheye plugin.
+ * This is the recommended approach for implementing lensing with Cartesian distortion.
+ * @param {Object} params
+ * @param {Function} params.xScale - D3 scale for X-axis
+ * @param {Function} params.yScale - D3 scale for Y-axis
+ * @param {number} params.distortion - Distortion factor (default: 3)
+ * @param {Function} params.getDistortion - Optional getter function for dynamic distortion
+ * @returns {Object} Object with fisheyeX, fisheyeY, focus, and distortion methods
+ */
+export function createD3CartesianFisheye(params) {
+  const { xScale, yScale, distortion = 3, getDistortion } = params;
+  
+  // Create fisheye scales
+  let fisheyeX = fisheyeScale(xScale, getDistortion ? getDistortion() : distortion, 0);
+  let fisheyeY = fisheyeScale(yScale, getDistortion ? getDistortion() : distortion, 0);
+  
+  return {
+    fisheyeX: function(value) {
+      // Update distortion if getter is provided
+      if (getDistortion) {
+        const currentDistortion = getDistortion();
+        if (fisheyeX.distortion() !== currentDistortion) {
+          fisheyeX = fisheyeScale(xScale, currentDistortion, fisheyeX.focus());
+        }
+      }
+      return fisheyeX(value);
+    },
+    
+    fisheyeY: function(value) {
+      // Update distortion if getter is provided
+      if (getDistortion) {
+        const currentDistortion = getDistortion();
+        if (fisheyeY.distortion() !== currentDistortion) {
+          fisheyeY = fisheyeScale(yScale, currentDistortion, fisheyeY.focus());
+        }
+      }
+      return fisheyeY(value);
+    },
+    
+    focus: function(x, y) {
+      if (x !== undefined) fisheyeX.focus(x);
+      if (y !== undefined) fisheyeY.focus(y);
+      return this;
+    },
+    
+    distortion: function() {
+      return getDistortion ? getDistortion() : distortion;
     }
   };
 }

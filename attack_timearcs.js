@@ -7,7 +7,7 @@ import { buildLegend as createLegend, updateLegendVisualState as updateLegendUI,
 import { parseCSVStream, parseCSVLine } from './src/data/csvParser.js';
 import { detectTimestampUnit, createToDateConverter, createTimeScale, createIpScale, createWidthScale, calculateMaxArcRadius } from './src/scales/scaleFactory.js';
 import { createForceSimulation, runUntilConverged, createComponentSeparationForce, createWeakComponentSeparationForce, createComponentCohesionForce, createHubCenteringForce, createComponentYForce, initializeNodePositions, calculateComponentCenters, findComponentHubIps, calculateIpDegrees, calculateConnectionStrength, createMutualHubAttractionForce } from './src/layout/forceSimulation.js';
-import { applyLens1D, createLensXScale, createFisheyeScale, createHorizontalFisheyeScale, fisheyeDistort } from './src/scales/distortion.js';
+import { applyLens1D, createLensXScale, createFisheyeScale, createHorizontalFisheyeScale, fisheyeDistort, createD3CartesianFisheye, createD3FisheyeXScale, createD3FisheyeYScale } from './src/scales/distortion.js';
 import { computeIpSpans, createSpanData, renderRowLines, renderIpLabels, createLabelHoverHandler, createLabelMoveHandler, createLabelLeaveHandler, attachLabelHoverHandlers } from './src/rendering/rows.js';
 import { createArcHoverHandler, createArcMoveHandler, createArcLeaveHandler, attachArcHandlers } from './src/rendering/arcInteractions.js';
 import { loadAllMappings } from './src/mappings/loaders.js';
@@ -91,10 +91,8 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       fisheyeEnabled = !fisheyeEnabled;
       console.log('Fisheye toggled:', fisheyeEnabled);
 
-      // Reset to original positions when disabled
-      if (!fisheyeEnabled && resetFisheyeFn) {
-        resetFisheyeFn();
-      }
+      // Don't reset when disabled - keep the current fisheye effect
+      // User can use reset button to restore original positions
 
       // Update cursor on SVG
       const svgEl = d3.select('#chart');
@@ -112,10 +110,8 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       fisheyeEnabled = !fisheyeEnabled;
       console.log('Fisheye toggled (keyboard):', fisheyeEnabled);
 
-      // Reset to original positions when disabled
-      if (!fisheyeEnabled && resetFisheyeFn) {
-        resetFisheyeFn();
-      }
+      // Don't reset when disabled - keep the current fisheye effect
+      // User can use reset button to restore original positions
 
       // Update cursor on SVG
       const svgEl = d3.select('#chart');
@@ -124,6 +120,34 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
       updateLensingButtonState();
     }
   });
+
+  // Add reset button handler - set up after DOM is ready
+  // This will be called after the page loads
+  function setupResetButton() {
+    const resetFisheyeBtn = document.getElementById('resetFisheyeBtn');
+    if (resetFisheyeBtn) {
+      resetFisheyeBtn.addEventListener('click', () => {
+        console.log('Resetting fisheye to original positions');
+        if (resetFisheyeFn) {
+          resetFisheyeFn();
+        } else {
+          console.warn('Reset function not yet available. Please wait for visualization to load.');
+        }
+        // Also disable fisheye when resetting
+        fisheyeEnabled = false;
+        const svgEl = d3.select('#chart');
+        svgEl.style('cursor', 'default');
+        updateLensingButtonState();
+      });
+    }
+  }
+  
+  // Set up reset button when DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupResetButton);
+  } else {
+    setupResetButton();
+  }
 
   let width = DEFAULT_WIDTH; // updated on render
   let height = DEFAULT_HEIGHT; // updated on render
@@ -1670,6 +1694,7 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
     toggleLensingFn = toggleLensing;
 
     // Initialize fisheye scale for vertical row distortion
+    // Now uses D3 fisheye plugin with Cartesian distortion
     function initFisheye() {
       // Store original row positions from current node positions
       // This should be called AFTER the force simulation and auto-fit complete
@@ -1683,7 +1708,72 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         originalRowPositions.set(ip, currentY);
       });
 
-      // Create vertical fisheye scale using imported factory
+      // Create D3 fisheye scales with Cartesian distortion
+      // For Y-axis: create a linear scale that maps IP indices to their Y positions
+      // We need to create a scale that preserves the actual positions
+      const yPositions = ipsToUse.map(ip => originalRowPositions.get(ip) || y(ip));
+      const yMin = Math.min(...yPositions);
+      const yMax = Math.max(...yPositions);
+      
+      // Create a linear scale for Y-axis that maps IP index to Y position
+      // This allows D3 fisheye to work properly with continuous values
+      const yScaleForFisheye = d3.scaleLinear()
+        .domain([0, ipsToUse.length - 1])
+        .range([yMin, yMax]);
+      
+      // Create a mapping function that converts IP to index, then applies fisheye
+      const ipToIndex = new Map(ipsToUse.map((ip, idx) => [ip, idx]));
+      
+      // For X-axis: create a time scale for timestamps
+      const xScaleForFisheye = d3.scaleTime()
+        .domain([xMinDate, xMaxDate])
+        .range([xStart, currentXEnd]);
+
+      // Create D3 fisheye scales using the plugin with Cartesian distortion
+      // For Y-axis: create fisheye scale that works with IP indices
+      const fisheyeYScaleBase = createD3FisheyeYScale({
+        yScale: yScaleForFisheye,
+        distortion: fisheyeDistortion,
+        getDistortion: () => fisheyeDistortion
+      });
+      
+      // Wrap the fisheye Y scale to work with IPs instead of indices
+      const fisheyeYScale = (ip) => {
+        const idx = ipToIndex.get(ip);
+        if (idx === undefined) return originalRowPositions.get(ip) || y(ip);
+        return fisheyeYScaleBase(idx);
+      };
+
+      // For X-axis: create D3 fisheye scale
+      const fisheyeXScale = createD3FisheyeXScale({
+        xScale: xScaleForFisheye,
+        distortion: fisheyeDistortion,
+        getDistortion: () => fisheyeDistortion
+      });
+
+      // Create Cartesian fisheye (combines X and Y) - this is the main interface
+      // Note: We'll create a wrapper that handles IP-to-index conversion for Y-axis
+      const cartesianFisheyeBase = createD3CartesianFisheye({
+        xScale: xScaleForFisheye,
+        yScale: yScaleForFisheye,
+        distortion: fisheyeDistortion,
+        getDistortion: () => fisheyeDistortion
+      });
+      
+      // Wrap Cartesian fisheye to work with IPs
+      const cartesianFisheye = {
+        fisheyeX: cartesianFisheyeBase.fisheyeX,
+        fisheyeY: (ip) => {
+          const idx = ipToIndex.get(ip);
+          if (idx === undefined) return originalRowPositions.get(ip) || y(ip);
+          return cartesianFisheyeBase.fisheyeY(idx);
+        },
+        focus: cartesianFisheyeBase.focus,
+        distortion: cartesianFisheyeBase.distortion
+      };
+
+      // Store both the old interface (for backward compatibility) and new D3 fisheye
+      // Keep the old interface for now to maintain compatibility
       fisheyeScale = createFisheyeScale({
         sortedIps: ipsToUse,
         originalPositions: originalRowPositions,
@@ -1692,7 +1782,15 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         getDistortion: () => fisheyeDistortion
       });
 
-      // Create horizontal fisheye scale using imported factory
+      // Store D3 fisheye scales for Cartesian distortion
+      fisheyeScale._d3FisheyeY = fisheyeYScale;
+      fisheyeScale._d3FisheyeX = fisheyeXScale;
+      fisheyeScale._d3Cartesian = cartesianFisheye;
+      fisheyeScale._yScaleForFisheye = yScaleForFisheye;
+      fisheyeScale._xScaleForFisheye = xScaleForFisheye;
+      fisheyeScale._ipToIndex = ipToIndex;
+
+      // Create horizontal fisheye scale using imported factory (for backward compatibility)
       horizontalFisheyeScale = createHorizontalFisheyeScale({
         xStart,
         xEnd: currentXEnd,
@@ -1701,56 +1799,89 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         getDistortion: () => fisheyeDistortion
       });
 
-      console.log('Fisheye initialized:', {
+      console.log('D3 Fisheye initialized with Cartesian distortion:', {
         numIps: ipsToUse.length,
         focus: fisheyeScale._focus,
         distortion: fisheyeDistortion,
+        hasD3Fisheye: !!fisheyeScale._d3Cartesian,
         sampleOriginalPositions: Array.from(originalRowPositions.entries()).slice(0, 3)
       });
     }
 
-    // Apply fisheye distortion based on mouse position
+    // Apply fisheye distortion based on mouse position using D3 fisheye with Cartesian distortion
     function applyFisheye(mouseX, mouseY) {
       if (!fisheyeEnabled || !fisheyeScale) return;
 
-      // Debug: log focus positions and ranges
-      console.log('Applying fisheye:', {
-        mouseX,
-        mouseY,
-        verticalRange: `${MARGIN.top} to ${MARGIN.top + INNER_HEIGHT}`,
-        horizontalRange: `${xStart} to ${xEnd}`,
-        verticalFocusNormalized: (mouseY - MARGIN.top) / INNER_HEIGHT,
-        horizontalFocusNormalized: (mouseX - xStart) / (xEnd - xStart)
-      });
+      // Use D3 fisheye Cartesian distortion if available
+      if (fisheyeScale._d3Cartesian) {
+        const cartesianFisheye = fisheyeScale._d3Cartesian;
+        
+        // Update focus points for both X and Y axes
+        cartesianFisheye.focus(mouseX, mouseY);
 
-      // Update vertical fisheye focus point
-      fisheyeScale.focus(mouseY);
+        // Use sortedIps (from force simulation) to maintain the original order
+        const ipsToUse = fisheyeScale._sortedIps || sortedIps || allIps;
 
-      // Update horizontal fisheye focus point
-      if (horizontalFisheyeScale) {
-        horizontalFisheyeScale.focus(mouseX);
+        // Transform all row positions using D3 fisheye Y scale
+        let prevY = -Infinity;
+        ipsToUse.forEach((ip) => {
+          // Apply D3 fisheye distortion to Y position
+          let distortedY = cartesianFisheye.fisheyeY(ip);
+
+          // Ensure monotonicity: each row must be at or below the previous row
+          if (distortedY <= prevY) {
+            distortedY = prevY + 1; // Minimum spacing of 1 pixel
+          }
+          prevY = distortedY;
+
+          // Update node positions
+          const node = ipToNode.get(ip);
+          if (node) {
+            node.y = distortedY;
+          }
+        });
+
+        // Update horizontal fisheye for timeline (X-axis)
+        if (horizontalFisheyeScale) {
+          horizontalFisheyeScale.focus(mouseX);
+        }
+
+        console.log('Applied D3 fisheye Cartesian distortion:', {
+          mouseX,
+          mouseY,
+          distortion: cartesianFisheye.distortion()
+        });
+      } else {
+        // Fallback to old implementation for backward compatibility
+        // Update vertical fisheye focus point
+        fisheyeScale.focus(mouseY);
+
+        // Update horizontal fisheye focus point
+        if (horizontalFisheyeScale) {
+          horizontalFisheyeScale.focus(mouseX);
+        }
+
+        // Use sortedIps (from force simulation) to maintain the original order
+        const ipsToUse = fisheyeScale._sortedIps || sortedIps || allIps;
+
+        // Transform all row positions, ensuring monotonicity
+        let prevY = -Infinity;
+        ipsToUse.forEach((ip) => {
+          let distortedY = fisheyeScale.apply(ip);
+
+          // Ensure monotonicity: each row must be at or below the previous row
+          if (distortedY <= prevY) {
+            distortedY = prevY + 1; // Minimum spacing of 1 pixel
+          }
+          prevY = distortedY;
+
+          // Update node positions
+          const node = ipToNode.get(ip);
+          if (node) {
+            node.y = distortedY;
+          }
+        });
       }
-
-      // Use sortedIps (from force simulation) to maintain the original order
-      const ipsToUse = fisheyeScale._sortedIps || sortedIps || allIps;
-
-      // Transform all row positions, ensuring monotonicity
-      let prevY = -Infinity;
-      ipsToUse.forEach((ip) => {
-        let distortedY = fisheyeScale.apply(ip);
-
-        // Ensure monotonicity: each row must be at or below the previous row
-        if (distortedY <= prevY) {
-          distortedY = prevY + 1; // Minimum spacing of 1 pixel
-        }
-        prevY = distortedY;
-
-        // Update node positions
-        const node = ipToNode.get(ip);
-        if (node) {
-          node.y = distortedY;
-        }
-      });
 
       // Update row lines
       rows.selectAll('line')
@@ -1770,9 +1901,19 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
           return node ? node.y : y(d);
         });
 
-      // Update arc paths with new Y positions
+      // Update arc paths with new Y positions and X positions (if using D3 fisheye)
       arcPaths.attr('d', d => {
-        const xp = xScaleLens(d.minute);
+        let xp;
+        // Use D3 fisheye X scale if available for horizontal distortion
+        if (fisheyeScale._d3Cartesian) {
+          const cartesianFisheye = fisheyeScale._d3Cartesian;
+          // Convert timestamp to Date for the fisheye X scale
+          const timestampDate = toDate(d.minute);
+          xp = cartesianFisheye.fisheyeX(timestampDate);
+        } else {
+          xp = xScaleLens(d.minute);
+        }
+        
         const y1 = ipToNode.get(d.sourceNode.name)?.y || y(d.sourceNode.name);
         const y2 = ipToNode.get(d.targetNode.name)?.y || y(d.targetNode.name);
 
@@ -1787,7 +1928,16 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
 
       // Update gradients
       linksWithNodes.forEach(d => {
-        const xp = xScaleLens(d.minute);
+        let xp;
+        // Use D3 fisheye X scale if available for horizontal distortion
+        if (fisheyeScale._d3Cartesian) {
+          const cartesianFisheye = fisheyeScale._d3Cartesian;
+          const timestampDate = toDate(d.minute);
+          xp = cartesianFisheye.fisheyeX(timestampDate);
+        } else {
+          xp = xScaleLens(d.minute);
+        }
+        
         const y1 = ipToNode.get(d.sourceNode.name)?.y || y(d.sourceNode.name);
         const y2 = ipToNode.get(d.targetNode.name)?.y || y(d.targetNode.name);
 
@@ -1953,10 +2103,9 @@ import { setupWindowResizeHandler as setupWindowResizeHandlerFromModule } from '
         }
       })
       .on('mouseleave', function() {
-        if (fisheyeEnabled) {
-          currentMouseX = null;
-          resetFisheye();
-        }
+        // Don't reset on mouseleave - keep the fisheye effect
+        // User can use reset button to restore original positions
+        currentMouseX = null;
       });
 
     // Update visualization with current lens state
