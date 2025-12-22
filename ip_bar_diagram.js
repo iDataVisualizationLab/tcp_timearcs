@@ -1438,8 +1438,31 @@ async function updateIPFilter() {
         const stats = calculateGroundTruthStats(groundTruthData, selectedIPs, eventColors);
         sbUpdateGroundTruthStatsUI(stats.html, stats.hasMatches);
 
+        // Sort selected IPs by earliest connection time (for chronological ordering)
+        const dataForTimeCalc = filteredData.length > 0 ? filteredData : fullData;
+        const earliestTimeForSelected = new Map();
+        dataForTimeCalc.forEach(p => {
+            const time = p.timestamp || Infinity;
+            if (p.src_ip && selectedIPSet.has(p.src_ip)) {
+                if (!earliestTimeForSelected.has(p.src_ip) || time < earliestTimeForSelected.get(p.src_ip)) {
+                    earliestTimeForSelected.set(p.src_ip, time);
+                }
+            }
+            if (p.dst_ip && selectedIPSet.has(p.dst_ip)) {
+                if (!earliestTimeForSelected.has(p.dst_ip) || time < earliestTimeForSelected.get(p.dst_ip)) {
+                    earliestTimeForSelected.set(p.dst_ip, time);
+                }
+            }
+        });
+        const sortedSelectedIPs = selectedIPs.slice().sort((a, b) => {
+            const timeA = earliestTimeForSelected.get(a) || Infinity;
+            const timeB = earliestTimeForSelected.get(b) || Infinity;
+            if (timeA !== timeB) return timeA - timeB; // Earliest first (ascending)
+            return a.localeCompare(b);
+        });
+
         // Compute force layout positions for IPs before visualization
-        computeForceLayoutPositions(filteredData, selectedIPs, () => {
+        computeForceLayoutPositions(filteredData, sortedSelectedIPs, () => {
             // Recreate visualization with filtered data after force layout completes
             visualizeTimeArcs(filteredData);
             // Sidebar flag stats suppressed; render flags legend in-canvas
@@ -2360,15 +2383,32 @@ function visualizeTimeArcs(packets) {
         if (p.dst_ip) ipCounts.set(p.dst_ip, (ipCounts.get(p.dst_ip) || 0) + 1);
     });
 
+    // Calculate earliest timestamp for each IP (for chronological ordering)
+    const earliestTime = new Map();
+    packets.forEach(p => {
+        const time = p.timestamp || Infinity;
+        if (p.src_ip) {
+            if (!earliestTime.has(p.src_ip) || time < earliestTime.get(p.src_ip)) {
+                earliestTime.set(p.src_ip, time);
+            }
+        }
+        if (p.dst_ip) {
+            if (!earliestTime.has(p.dst_ip) || time < earliestTime.get(p.dst_ip)) {
+                earliestTime.set(p.dst_ip, time);
+            }
+        }
+    });
+
     const ipList = Array.from(new Set(Array.from(ipCounts.keys())));
 
     // Check if force layout has already computed positions
     if (ipOrder.length === 0 || ipPositions.size === 0 || ipOrder.length !== ipList.length) {
-        // Force layout hasn't run yet or IP set has changed - use simple sort
+        // Force layout hasn't run yet or IP set has changed - sort by earliest connection time
         ipList.sort((a, b) => {
-            const ca = ipCounts.get(a) || 0;
-            const cb = ipCounts.get(b) || 0;
-            if (cb !== ca) return cb - ca;
+            const timeA = earliestTime.get(a) || Infinity;
+            const timeB = earliestTime.get(b) || Infinity;
+            if (timeA !== timeB) return timeA - timeB; // Earliest first (ascending)
+            // If times are equal, fall back to name comparison
             return a.localeCompare(b);
         });
         // Initialize positions and order

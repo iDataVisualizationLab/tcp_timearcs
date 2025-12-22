@@ -838,23 +838,33 @@ def generate_time_bins(records, num_bins=100):
 
     return bins
 
-def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=None,
-                             chunk_size=200, chunk_read_size=500000, flow_timeout_seconds=300):
+def process_tcp_data_chunked(data_files, ip_map_file, output_dir, max_records=None,
+                             chunk_size=200, chunk_read_size=500000, flow_timeout_seconds=300,
+                             filter_ips=None, filter_time_start=None, filter_time_end=None,
+                             attack_context=None):
     """
     Process TCP data and create chunked output structure (v2.0) - STREAMING VERSION
 
     Memory-optimized: processes CSV in chunks to avoid loading entire file into memory.
 
     Args:
-        data_file: Input CSV file path
+        data_files: Input CSV file path(s) - can be a single file or list of files
         ip_map_file: IP mapping JSON file path
         output_dir: Output directory path
         max_records: Maximum records to process (None = all)
         chunk_size: Flows per output chunk file (default: 200)
         chunk_read_size: CSV rows per read chunk (default: 500000)
         flow_timeout_seconds: Seconds of inactivity before flow timeout (default: 300)
+        filter_ips: Comma-separated list of IP IDs or dotted-quad IPs to filter (None = no filter)
+        filter_time_start: Filter packets with timestamp >= this value (microseconds since epoch, None = no filter)
+        filter_time_end: Filter packets with timestamp <= this value (microseconds since epoch, None = no filter)
+        attack_context: Attack type label for this subset (stored in manifest.json for UI display)
     """
 
+    # Normalize data_files to a list
+    if isinstance(data_files, str):
+        data_files = [data_files]
+    
     # Create output directory structure
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -871,10 +881,15 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
     print(f"Loading IP mapping from {ip_map_file}...")
     ip_map, int_to_ip = load_ip_mapping(ip_map_file)
 
-    print(f"Processing TCP data from {data_file} in chunks of {chunk_read_size:,} rows...")
+    # Parse filter IPs once at the start
+    ip_filter_set = None
+    if filter_ips:
+        ip_filter_set = set(filter_ips.split(','))
+        print(f"IP filter: {len(ip_filter_set)} IP(s) specified")
 
-    # Determine compression
-    compression = 'gzip' if data_file.endswith('.gz') else None
+    # Initialize filtering statistics
+    total_packets_before_filter = 0
+    total_packets_after_filter = 0
 
     # Initialize streaming state
     connection_map = {}          # Active flows
@@ -895,6 +910,11 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
     total_packets = 0
     tcp_packets = 0
     flow_counter = 0
+    
+    # Early termination tracking for time-based filtering
+    consecutive_empty_chunks = 0
+    max_timestamp_seen = 0  # Track the highest timestamp we've encountered
+    can_terminate_early = False  # Only allow early termination after passing filter_time_end
 
     # Flow chunk writing state
     flow_chunk_counter = 0
@@ -933,119 +953,173 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
         else:
             df_chunk[col_name] = series.astype(str).fillna('')
 
-    # Process CSV in chunks
-    try:
-        csv_iterator = pd.read_csv(data_file, chunksize=chunk_read_size, compression=compression)
+    # Process each file sequentially
+    for file_idx, data_file in enumerate(data_files, start=1):
+        print(f"\n[{file_idx}/{len(data_files)}] Processing: {data_file}")
+        
+        if not Path(data_file).exists():
+            print(f"  Warning: File '{data_file}' not found, skipping...")
+            continue
 
-        for df_chunk in csv_iterator:
-            chunk_number += 1
+        # Determine compression
+        compression = 'gzip' if data_file.endswith('.gz') else None
 
-            # Robust timestamp cleaning for this chunk
-            if 'timestamp' in df_chunk.columns:
-                df_chunk['timestamp'] = pd.to_numeric(df_chunk['timestamp'], errors='coerce')
-                before_drop_count = len(df_chunk)
-                df_chunk = df_chunk[df_chunk['timestamp'].notna() & np.isfinite(df_chunk['timestamp'])]
-                dropped_count = before_drop_count - len(df_chunk)
-                if dropped_count > 0 and chunk_number == 1:
-                    print(f"Note: Dropping rows with invalid timestamps (chunk 1: {dropped_count} dropped)")
+        # Process CSV in chunks
+        try:
+            csv_iterator = pd.read_csv(data_file, chunksize=chunk_read_size, compression=compression)
 
-            # Convert integer IPs to dotted notation
-            _convert_ip_column(df_chunk, 'src_ip')
-            _convert_ip_column(df_chunk, 'dst_ip')
+            for df_chunk in csv_iterator:
+                chunk_number += 1
+                total_packets_before_filter += len(df_chunk)
 
-            # Process flags
-            if 'flags' in df_chunk.columns:
-                df_chunk['flag_type'] = df_chunk['flags'].apply(classify_tcp_flags)
+                # Robust timestamp cleaning for this chunk
+                if 'timestamp' in df_chunk.columns:
+                    df_chunk['timestamp'] = pd.to_numeric(df_chunk['timestamp'], errors='coerce')
+                    before_drop_count = len(df_chunk)
+                    df_chunk = df_chunk[df_chunk['timestamp'].notna() & np.isfinite(df_chunk['timestamp'])]
+                    dropped_count = before_drop_count - len(df_chunk)
+                    if dropped_count > 0 and chunk_number == 1:
+                        print(f"Note: Dropping rows with invalid timestamps (chunk 1: {dropped_count} dropped)")
 
-            # Convert chunk to list of dictionaries
-            chunk_records = []
-            for _, row in df_chunk.iterrows():
-                proto_raw = row.get('protocol') if 'protocol' in df_chunk.columns else None
-                try:
-                    if proto_raw is not None and not pd.isna(proto_raw):
-                        protocol_val = int(proto_raw)
-                    else:
+                # Track max timestamp BEFORE filtering (to detect when we've passed the time window)
+                if filter_time_end is not None and 'timestamp' in df_chunk.columns and len(df_chunk) > 0:
+                    chunk_max_timestamp = df_chunk['timestamp'].max()
+                    if pd.notna(chunk_max_timestamp):
+                        if chunk_max_timestamp > max_timestamp_seen:
+                            max_timestamp_seen = chunk_max_timestamp
+                        
+                        # Enable early termination only after we've seen timestamps beyond filter_time_end
+                        if max_timestamp_seen > filter_time_end:
+                            can_terminate_early = True
+
+                # Apply time range filter BEFORE IP conversion (for performance)
+                if filter_time_start is not None:
+                    df_chunk = df_chunk[df_chunk['timestamp'] >= filter_time_start]
+                if filter_time_end is not None:
+                    df_chunk = df_chunk[df_chunk['timestamp'] <= filter_time_end]
+
+                # Convert integer IPs to dotted notation
+                _convert_ip_column(df_chunk, 'src_ip')
+                _convert_ip_column(df_chunk, 'dst_ip')
+
+                # Apply IP filter (match either src_ip OR dst_ip)
+                # Works with both numeric IDs and dotted-quad IPs
+                if ip_filter_set:
+                    src_match = df_chunk['src_ip'].astype(str).isin(ip_filter_set)
+                    dst_match = df_chunk['dst_ip'].astype(str).isin(ip_filter_set)
+                    df_chunk = df_chunk[src_match | dst_match]
+
+                # Skip empty chunks (with smart early termination)
+                if len(df_chunk) == 0:
+                    print(f"Chunk {chunk_number}: skipped (no matching packets)")
+                    consecutive_empty_chunks += 1
+                    
+                    # Early termination: Only stop if we've confirmed we're past the time range
+                    # This handles gaps in data and sparse IP filtering
+                    if can_terminate_early and consecutive_empty_chunks >= 50:
+                        print(f"\n⚠️  Stopping early: {consecutive_empty_chunks} consecutive empty chunks "
+                              f"after passing filter_time_end ({max_timestamp_seen} > {filter_time_end})")
+                        break
+                    continue
+
+                # Reset empty chunk counter when we find packets
+                consecutive_empty_chunks = 0
+                total_packets_after_filter += len(df_chunk)
+
+                # Process flags
+                if 'flags' in df_chunk.columns:
+                    df_chunk['flag_type'] = df_chunk['flags'].apply(classify_tcp_flags)
+
+                # Convert chunk to list of dictionaries
+                chunk_records = []
+                for _, row in df_chunk.iterrows():
+                    proto_raw = row.get('protocol') if 'protocol' in df_chunk.columns else None
+                    try:
+                        if proto_raw is not None and not pd.isna(proto_raw):
+                            protocol_val = int(proto_raw)
+                        else:
+                            protocol_val = ''
+                    except Exception:
                         protocol_val = ''
-                except Exception:
-                    protocol_val = ''
 
-                record = {
-                    'timestamp': _safe_int(row.get('timestamp', 0), 0),
-                    'src_ip': str(row.get('src_ip', '')),
-                    'dst_ip': str(row.get('dst_ip', '')),
-                    'src_port': _safe_int(row.get('src_port', 0), 0),
-                    'dst_port': _safe_int(row.get('dst_port', 0), 0),
-                    'flags': _safe_int(row.get('flags', 0), 0),
-                    'flag_type': row.get('flag_type', 'UNKNOWN'),
-                    'seq_num': _safe_int(row.get('seq_num', 0), 0),
-                    'ack_num': _safe_int(row.get('ack_num', 0), 0),
-                    'length': _safe_int(row.get('length', 0), 0),
-                    'protocol': protocol_val
-                }
-                chunk_records.append(record)
+                    record = {
+                        'timestamp': _safe_int(row.get('timestamp', 0), 0),
+                        'src_ip': str(row.get('src_ip', '')),
+                        'dst_ip': str(row.get('dst_ip', '')),
+                        'src_port': _safe_int(row.get('src_port', 0), 0),
+                        'dst_port': _safe_int(row.get('dst_port', 0), 0),
+                        'flags': _safe_int(row.get('flags', 0), 0),
+                        'flag_type': row.get('flag_type', 'UNKNOWN'),
+                        'seq_num': _safe_int(row.get('seq_num', 0), 0),
+                        'ack_num': _safe_int(row.get('ack_num', 0), 0),
+                        'length': _safe_int(row.get('length', 0), 0),
+                        'protocol': protocol_val
+                    }
+                    chunk_records.append(record)
 
-            # Apply max_records limit
-            if max_records and total_packets + len(chunk_records) > max_records:
-                chunk_records = chunk_records[:max_records - total_packets]
+                # Apply max_records limit
+                if max_records and total_packets + len(chunk_records) > max_records:
+                    chunk_records = chunk_records[:max_records - total_packets]
 
-            total_packets += len(chunk_records)
+                total_packets += len(chunk_records)
 
-            # Write packets incrementally to packets.csv
-            if chunk_records:
-                chunk_df = pd.DataFrame(chunk_records)
-                if not packets_written:
-                    chunk_df.to_csv(packets_file, mode='w', index=False)
-                    packets_written = True
-                else:
-                    chunk_df.to_csv(packets_file, mode='a', index=False, header=False)
+                # Write packets incrementally to packets.csv
+                if chunk_records:
+                    chunk_df = pd.DataFrame(chunk_records)
+                    if not packets_written:
+                        chunk_df.to_csv(packets_file, mode='w', index=False)
+                        packets_written = True
+                    else:
+                        chunk_df.to_csv(packets_file, mode='a', index=False, header=False)
 
-                # Update unique IPs and timestamps
-                unique_ips.update([r['src_ip'] for r in chunk_records])
-                unique_ips.update([r['dst_ip'] for r in chunk_records])
-                all_timestamps.extend([r['timestamp'] for r in chunk_records])
+                    # Update unique IPs and timestamps
+                    unique_ips.update([r['src_ip'] for r in chunk_records])
+                    unique_ips.update([r['dst_ip'] for r in chunk_records])
+                    all_timestamps.extend([r['timestamp'] for r in chunk_records])
 
-                # Incremental flow detection
-                tcp_chunk = [r for r in chunk_records if r.get('protocol') == 6 or str(r.get('protocol')).upper() == 'TCP']
-                tcp_packets += len(tcp_chunk)
+                    # Incremental flow detection
+                    tcp_chunk = [r for r in chunk_records if r.get('protocol') == 6 or str(r.get('protocol')).upper() == 'TCP']
+                    tcp_packets += len(tcp_chunk)
 
-                if tcp_chunk:
-                    completed_flows, flow_counter, timed_out = detect_tcp_flows_incremental(
-                        tcp_chunk,
-                        connection_map,
-                        ip_stats,
-                        flag_stats,
-                        ip_pair_map,
-                        flow_counter,
-                        flow_timeout_seconds
-                    )
+                    if tcp_chunk:
+                        completed_flows, flow_counter, timed_out = detect_tcp_flows_incremental(
+                            tcp_chunk,
+                            connection_map,
+                            ip_stats,
+                            flag_stats,
+                            ip_pair_map,
+                            flow_counter,
+                            flow_timeout_seconds
+                        )
 
-                    all_completed_flows.extend(completed_flows)
+                        all_completed_flows.extend(completed_flows)
 
-                    # Write flow chunks incrementally when buffer is full (frees memory!)
-                    while len(all_completed_flows) >= chunk_size:
-                        flows_to_write = all_completed_flows[:chunk_size]
-                        chunk_filename = write_flow_chunk(flows_to_write, flow_chunk_counter,
-                                                          flows_dir, flows_index)
-                        flow_chunk_counter += 1
-                        total_flows_written += len(flows_to_write)
-                        all_completed_flows = all_completed_flows[chunk_size:]  # Remove written flows
-                        print(f"  → Wrote flow chunk {chunk_filename} ({len(flows_to_write)} flows, "
-                              f"freed ~{len(flows_to_write) * 50 * 100 / 1024:.1f}KB memory)")
+                        # Write flow chunks incrementally when buffer is full (frees memory!)
+                        while len(all_completed_flows) >= chunk_size:
+                            flows_to_write = all_completed_flows[:chunk_size]
+                            chunk_filename = write_flow_chunk(flows_to_write, flow_chunk_counter,
+                                                              flows_dir, flows_index)
+                            flow_chunk_counter += 1
+                            total_flows_written += len(flows_to_write)
+                            all_completed_flows = all_completed_flows[chunk_size:]  # Remove written flows
+                            print(f"  → Wrote flow chunk {chunk_filename} ({len(flows_to_write)} flows, "
+                                  f"freed ~{len(flows_to_write) * 50 * 100 / 1024:.1f}KB memory)")
 
-                    # Enhanced progress output showing timeout statistics
-                    print(f"Chunk {chunk_number}: processed {len(chunk_records):,} packets, "
-                          f"{len(tcp_chunk):,} TCP, {len(connection_map):,} active flows, "
-                          f"{len(completed_flows):,} completed ({timed_out} by timeout), "
-                          f"buffered flows: {len(all_completed_flows)}, total: {total_packets:,}")
+                        # Enhanced progress output showing timeout statistics
+                        print(f"Chunk {chunk_number}: processed {len(chunk_records):,} packets, "
+                              f"{len(tcp_chunk):,} TCP, {len(connection_map):,} active flows, "
+                              f"{len(completed_flows):,} completed ({timed_out} by timeout), "
+                              f"buffered flows: {len(all_completed_flows)}, total: {total_packets:,}")
 
-            # Check if we've reached max_records limit
-            if max_records and total_packets >= max_records:
-                print(f"Reached max_records limit of {max_records:,}")
-                break
+                # Check if we've reached max_records limit
+                if max_records and total_packets >= max_records:
+                    print(f"Reached max_records limit of {max_records:,}")
+                    break
 
-    except Exception as e:
-        print(f"Error reading CSV: {e}", file=sys.stderr)
-        raise
+        except Exception as e:
+            print(f"Error reading CSV file '{data_file}': {e}", file=sys.stderr)
+            print(f"Continuing with next file...")
+            continue
 
     # Finalize: process all remaining active flows
     print(f"\nFinalizing {len(connection_map):,} remaining active flows...")
@@ -1073,6 +1147,14 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
     # Calculate timeout statistics from flows_index
     flows_by_timeout = sum(1 for f in flows_index if f.get('ongoing', False))
     flows_by_close = len(flows_index) - flows_by_timeout
+
+    # Print filtering statistics
+    if filter_ips or filter_time_start is not None or filter_time_end is not None:
+        filtered_out = total_packets_before_filter - total_packets_after_filter
+        print(f"\nFiltering statistics:")
+        print(f"  - Packets before filter: {total_packets_before_filter:,}")
+        print(f"  - Packets after filter: {total_packets_after_filter:,}")
+        print(f"  - Packets filtered out: {filtered_out:,} ({100 * filtered_out / total_packets_before_filter:.1f}%)")
 
     print(f"\nProcessing complete:")
     print(f"  - Total packets: {total_packets:,}")
@@ -1121,7 +1203,8 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
         'version': '2.0',
         'format': 'chunked',
         'created': pd.Timestamp.now().isoformat(),
-        'source_file': str(data_file),
+        'source_file': str(data_files[0]) if len(data_files) == 1 else None,  # Backward compatibility
+        'source_files': [str(f) for f in data_files],  # NEW: List of source files processed
         'total_packets': total_packets,
         'tcp_packets': tcp_packets,
         'unique_ips': len(unique_ips),
@@ -1141,6 +1224,19 @@ def process_tcp_data_chunked(data_file, ip_map_file, output_dir, max_records=Non
             'ip_stats': 'ips/ip_stats.json',
             'flag_stats': 'ips/flag_stats.json',
             'unique_ips': 'ips/unique_ips.json'
+        },
+        # NEW: Attack context from selection
+        'attack_context': {
+            'type': attack_context,
+            'source': 'attack_timearcs_selection'
+        } if attack_context else None,
+        # NEW: Filter parameters applied
+        'filter_applied': {
+            'ips': filter_ips.split(',') if filter_ips else None,
+            'time_start_us': filter_time_start,
+            'time_end_us': filter_time_end,
+            'time_start_minutes': filter_time_start // 60_000_000 if filter_time_start else None,
+            'time_end_minutes': filter_time_end // 60_000_000 if filter_time_end else None
         }
     }
 
@@ -1173,7 +1269,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Convert TCP data to chunked file structure (v2.0) - STREAMING/MEMORY-EFFICIENT VERSION. '
                     'Processes large CSV files in chunks to avoid out-of-memory errors.')
-    parser.add_argument('--data', required=True, help='Input TCP data file (CSV or CSV.GZ)')
+    parser.add_argument('--data', nargs='+', required=True,
+                       help='Input TCP data file(s) (CSV or CSV.GZ) - can specify multiple files for multi-day analysis')
     parser.add_argument('--ip-map', required=True, help='IP mapping JSON file')
     parser.add_argument('--output-dir', required=True, help='Output directory for chunked files')
     parser.add_argument('--max-records', type=int, help='Maximum number of records to process')
@@ -1187,13 +1284,22 @@ def main():
                             'Flows without FIN/RST are completed after this many seconds of no packets. '
                             'Common values: 60 (1 min), 300 (5 min, recommended), 1800 (30 min). '
                             'Use very large value (e.g., 999999) to disable timeout.')
+    parser.add_argument('--filter-ips', type=str, default=None,
+                       help='Comma-separated list of IP IDs to filter (e.g., "1,2,7204"). Only packets involving these IPs are processed.')
+    parser.add_argument('--filter-time-start', type=int, default=None,
+                       help='Filter packets with timestamp >= this value (microseconds since epoch)')
+    parser.add_argument('--filter-time-end', type=int, default=None,
+                       help='Filter packets with timestamp <= this value (microseconds since epoch)')
+    parser.add_argument('--attack-context', type=str, default=None,
+                       help='Attack type label for this subset (stored in manifest.json for UI display)')
 
     args = parser.parse_args()
 
-    # Check if input files exist
-    if not Path(args.data).exists():
-        print(f"Error: Data file '{args.data}' not found", file=sys.stderr)
-        sys.exit(1)
+    # Check if input files exist (now a list)
+    for data_file in args.data:
+        if not Path(data_file).exists():
+            print(f"Warning: Data file '{data_file}' not found", file=sys.stderr)
+            # Don't exit - just warn, the loop will skip missing files
 
     if not Path(args.ip_map).exists():
         print(f"Error: IP mapping file '{args.ip_map}' not found", file=sys.stderr)
@@ -1201,7 +1307,9 @@ def main():
 
     try:
         process_tcp_data_chunked(args.data, args.ip_map, args.output_dir, args.max_records,
-                                 args.chunk_size, args.chunk_read_size, args.flow_timeout_seconds)
+                                 args.chunk_size, args.chunk_read_size, args.flow_timeout_seconds,
+                                 args.filter_ips, args.filter_time_start, args.filter_time_end,
+                                 args.attack_context)
     except Exception as e:
         print(f"Error processing data: {e}", file=sys.stderr)
         import traceback
